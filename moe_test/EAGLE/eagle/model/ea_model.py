@@ -14,6 +14,8 @@ from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 #from .modeling_qwen2_kv import LlamaForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen2_kv import Qwen2ForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
+from .modeling_qwen3moe_kv import Qwen3MoeForCausalLM as KVQwen3MoeForCausalLM
+from .modeling_phimoe_kv import PhiMoEForCausalLM as KVPhiMoEForCausalLM
 from .utils import *
 from .kv_cache import initialize_past_key_values
 
@@ -43,7 +45,8 @@ class EaModel(nn.Module):
         self.hidden_size = base_model.lm_head.weight.shape[-1]
         self.vocab_size = base_model.lm_head.weight.shape[0]
         self.base_model_name_or_path = base_model_name_or_path
-        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
+        # self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path)
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path, "r") as f:
@@ -112,7 +115,16 @@ class EaModel(nn.Module):
             base_model = KVQwen3ForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
+        elif Type == 'Qwen3MoeForCausalLM':
+            base_model = KVQwen3MoeForCausalLM.from_pretrained(
+                base_model_path, **kwargs
+            )
+        elif Type == 'PhiMoEForCausalLM':
+            base_model = KVPhiMoEForCausalLM.from_pretrained(
+                base_model_path, **kwargs
+            )
         else:
+            print(Type)
             base_model = KVMixtralForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
@@ -248,6 +260,7 @@ class EaModel(nn.Module):
         )
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
+        accept_lengths = []
         for idx in range(max_length):
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
@@ -271,6 +284,7 @@ class EaModel(nn.Module):
                 logits, candidates, logits_processor
             )
             # print(accept_length)
+            accept_lengths.append(accept_length)
             # Adjusting the input sequence, draft model forward
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
@@ -298,9 +312,9 @@ class EaModel(nn.Module):
             if input_ids.shape[1] > max_length:
                 break
         if not log:
-            return input_ids
+            return input_ids, accept_lengths
         else:
-            return input_ids, new_token, idx
+            return input_ids, new_token, idx, accept_lengths
 
     @torch.no_grad()
     def naivegenerate(

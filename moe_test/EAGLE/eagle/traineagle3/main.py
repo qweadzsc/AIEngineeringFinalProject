@@ -20,7 +20,7 @@ with open(deepspeed_config) as f:
 train_config = {
     "bs": ds_config["train_micro_batch_size_per_gpu"],
     "num_epochs": 40,
-    "num_workers": 2,
+    "num_workers": 4,
     "max_len": 2048,
     "config_path": "config.json",
     "gradient_checkpoint": True
