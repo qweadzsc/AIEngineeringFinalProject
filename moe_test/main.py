@@ -6,6 +6,8 @@ from EAGLE.eagle.model.ea_model import EaModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from mlp import SPMLP
 
+torch.cuda.reset_peak_memory_stats()
+
 def run_hf_generation(model, tokenizer, input_ids, max_new_tokens, temperature=0.0, top_p=None, top_k=None):
     """Run generation using standard Hugging Face implementation."""
     generate_kwargs = {
@@ -38,8 +40,8 @@ dataset = load_dataset('/share/public/zhouyongkang/projects/sc/data/benchmark/al
 split_name = 'train' if 'train' in dataset else list(dataset.keys())[0]
 dataset_split = dataset[split_name]
 
-base_model_path = "/share/others/public_models/Qwen3-30B-A3B"
-EAGLE_model_path = "/share/public/zhouyongkang/models/qwen3_30b_moe_eagle3"
+base_model_path = "/share/public/zhouyongkang/models/Phi-tiny-MoE-instruct"
+EAGLE_model_path = "/share/public/zhouyongkang/models/phi-tiny-moe-eagle"
 
 # Define the generation method
 generation_method = input("Enter generation method: ").strip().lower()
@@ -54,6 +56,7 @@ if generation_method == 'hf':
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
+        trust_remote_code=True,
     )
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(base_model_path)
@@ -69,7 +72,8 @@ elif generation_method == 'eagle':
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
-        total_token=64
+        total_token=128,
+        use_eagle3=False,
     )
     model.eval()
     model.device = model.base_model.device
@@ -83,12 +87,13 @@ elif generation_method == 'mtp':
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
-        total_token=64
+        total_token=64,
+        use_eagle3=False,
     )
     model.eval()
     model.device = model.base_model.device
     for layer in tqdm(model.base_model.model.layers):
-        layer.mlp = SPMLP(layer.mlp)
+        layer.block_sparse_moe = SPMLP(layer.block_sparse_moe)
     tokenizer = model.tokenizer
 
 else:
@@ -124,8 +129,13 @@ for i in tqdm(range(num_prompts), desc="Processing prompts"):
     total_time += (end_time - start_time)
     total_al_mean += al_mean
 
+    # print(tokenizer.decode(output_ids[0]))
+
 average_time = total_time / num_prompts
 average_al = total_al_mean / num_prompts
 
 print(f"Average time across {num_prompts} prompts: {average_time:.4f} seconds")
 print(f"Average AL across {num_prompts} prompts: {average_al:.4f}")
+
+peak_memory = torch.cuda.max_memory_allocated()
+print(f"峰值显存占用: {peak_memory / 1024**3:.2f} GB")

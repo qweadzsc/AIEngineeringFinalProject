@@ -1104,16 +1104,23 @@ class PhiMoESparseMoeBlock(nn.Module):
         if self.training and self.input_jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise)
         hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        # print ( 'moe', self.iter, torch.norm(hidden_states).item())
-        router_logits = self.gate(hidden_states)
+        
+        # start_event = torch.cuda.Event(enable_timing=True)
+        # end_event = torch.cuda.Event(enable_timing=True)
+        # sparsemixer_start = torch.cuda.Event(enable_timing=True)
+        # sparsemixer_end = torch.cuda.Event(enable_timing=True)
 
+        # start_event.record()
+
+        router_logits = self.gate(hidden_states)
+        # sparsemixer_start.record()
         routing_weights, selected_experts = sparsemixer(
             router_logits, 
             top_k=2, 
             jitter_eps=self.router_jitter_noise, 
             training=self.training,
         )
+        # sparsemixer_end.record()
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -1146,6 +1153,20 @@ class PhiMoESparseMoeBlock(nn.Module):
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         # print ( 'moe', self.iter, torch.norm(final_hidden_states).item())
+
+        # end_event.record()
+
+        # torch.cuda.synchronize()
+        # total_time = start_event.elapsed_time(end_event)
+        # sparsemixer_time = sparsemixer_start.elapsed_time(sparsemixer_end)
+        # other_time = total_time - sparsemixer_time
+        # sparsemixer_ratio = (sparsemixer_time / total_time) * 100 if total_time > 0 else 0
+        # other_ratio = (other_time / total_time) * 100 if total_time > 0 else 0
+
+        # print(f"Total time: {total_time:.4f} ms")
+        # print(f"mysparsemixer time: {sparsemixer_time:.4f} ms ({sparsemixer_ratio:.2f}%)")
+        # print(f"Other operations time: {other_time:.4f} ms ({other_ratio:.2f}%)")
+
         return final_hidden_states, router_logits
 
 
