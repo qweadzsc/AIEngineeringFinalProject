@@ -14,13 +14,13 @@ cuda_sources = list(glob.glob(os.path.join(extensions_cuda_dir, "*.cu")))
 # sources += cuda_sources
 
 sources = [
-    "/share/public/zhouyongkang/projects/sc/moe_src/mlp_kernel/csrc/torch_api.cpp",
-    "/share/public/zhouyongkang/projects/sc/moe_src/mlp_kernel/csrc/cuda/cuda_api.cu",
-    "/share/public/zhouyongkang/projects/sc/moe_src/mlp_kernel/csrc/cuda/sddmm.cu",
-    "/share/public/zhouyongkang/projects/sc/moe_src/mlp_kernel/csrc/cuda/spmm.cu",
+    "./mlp_kernel/csrc/torch_api.cpp",
+    "./mlp_kernel/csrc/cuda/cuda_api.cu",
+    "./mlp_kernel/csrc/cuda/sddmm.cu",
+    "./mlp_kernel/csrc/cuda/spmm.cu",
 ]
 
-cutlass_path = "/share/public/zhouyongkang/projects/sc/deps/cutlass"
+cutlass_path = "/path/to/your/cutlass/"
 include_dirs = [
     '.',
     extensions_cuda_dir,

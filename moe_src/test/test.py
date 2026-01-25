@@ -36,7 +36,7 @@ def print_dense_dif(x, y, mask_c, eps=1e-5):
     total_elements = 0
     different_count = 0
     for i, c in enumerate(mask_c):
-        dc, te, md = print_dif(x[:, i*768:(i+1)*768], y[:, c*768:(c+1)*768], eps=eps, print_it=False)
+        dc, te, md = print_dif(x[:, i*448:(i+1)*448], y[:, c*448:(c+1)*448], eps=eps, print_it=False)
         diff.append(md)
         total_elements += te
         different_count += dc
@@ -49,9 +49,9 @@ def print_dense_dif(x, y, mask_c, eps=1e-5):
 def print_select_dif(x, y, mask_r, mask_c, eps=1e-5):
     mn = x.shape[0]
     sp = mask_c.shape[0]
-    asp = y.shape[1] // 768
-    x_reshaped = x.view(mn, sp, 768)
-    y_reshaped = y.view(-1, asp, 768)
+    asp = y.shape[1] // 448
+    x_reshaped = x.view(mn, sp, 448)
+    y_reshaped = y.view(-1, asp, 448)
     sy = y_reshaped[:, mask_c, :]  # shape: [64, sp, 768]
     
     i_indices = torch.arange(mn)[:, None]  # shape: [mn, 1]
@@ -105,8 +105,8 @@ class MLP(nn.Module):
 class TestCUDAMoe(nn.Module):
     def __init__(self, hid_dim, t_d, maxnnz, cuda_module=None):
         super().__init__()
-        self.num_experts = 128
-        self.top_k = 8
+        self.num_experts = 16
+        self.top_k = 2
         self.norm_topk_prob = True
         self.cuda_module = cuda_module
         self.hid_dim = hid_dim
@@ -116,11 +116,11 @@ class TestCUDAMoe(nn.Module):
         self.sp_pd = 1
         self.single_batch = 64
 
-        self.gate = nn.Linear(hid_dim, 128, bias=False, dtype=torch.float16)
+        self.gate = nn.Linear(hid_dim, 16, bias=False, dtype=torch.float16)
         self.experts = nn.ModuleList(
-            [MLP(hid_dim, 768) for _ in range(self.num_experts)]
+            [MLP(hid_dim, 448) for _ in range(self.num_experts)]
         )
-        self.single = MLP(hid_dim, 768*128, bias=False, dtype=torch.float16)
+        self.single = MLP(hid_dim, 448*16, bias=False, dtype=torch.float16)
         self.u = self.single.up_proj.weight.data
         self.g = self.single.gate_proj.weight.data
         self.d = self.single.down_proj.weight.data
@@ -236,10 +236,10 @@ class TestCUDAMoe(nn.Module):
             routing_n = torch.count_nonzero(routing_weights, dim=0)
             t_d, maxnnz = self.t_d, self.maxnnz
 
-            ir = torch.zeros(2, bs, t_d*768, dtype=x.dtype, device=x.device)
+            ir = torch.zeros(2, bs, t_d*448, dtype=x.dtype, device=x.device)
             mask_c = torch.topk(routing_n, t_d // self.sp_pd + t_d).indices
             mask_r = sparse_routing_weights[:, mask_c[t_d:]].topk(maxnnz, dim=0).indices
-            mask_v = torch.zeros(2, maxnnz, (t_d//self.sp_pd)*768,
+            mask_v = torch.zeros(2, maxnnz, (t_d//self.sp_pd)*448,
                                 dtype=x.dtype, device=x.device)
             result = torch.zeros(t_d, bs, self.hid_dim, dtype=x.dtype, device=x.device)
         
@@ -247,14 +247,14 @@ class TestCUDAMoe(nn.Module):
 
             mlp_kernel.ops.sddmm(
                 x, self.u, self.g, ir, mask_r, mask_c, mask_v,
-                bs, hidden_dim, 128*768, 768, t_d, maxnnz)
+                bs, hidden_dim, 16*448, 448, t_d, maxnnz)
             
             ir[0] *= torch.sigmoid(ir[1])
             mask_v[0] *= torch.sigmoid(mask_v[1])
 
             mlp_kernel.ops.spmm(
                 ir[0], self.d, result, mask_r, mask_c, mask_v[0], routing_weights,
-                bs, hidden_dim, 128*768, 768, t_d, maxnnz)
+                bs, hidden_dim, 16*448, 448, t_d, maxnnz)
             
             x = result.sum(0)
         
@@ -274,10 +274,10 @@ class TestCUDAMoe(nn.Module):
 
         ref = torch.zeros_like(x)
         for i, c in enumerate(mask_c[:self.t_d]):
-            ref += (ir[0, :, i*768:(i+1)*768] @ self.d[:, c*768:(c+1)*768].T) * \
+            ref += (ir[0, :, i*448:(i+1)*448] @ self.d[:, c*448:(c+1)*448].T) * \
                 routing_weights[:, c].unsqueeze(1)
-        spd = self.d.view(2048, 128, 768)[:, mask_c[self.t_d:]]
-        mask_v = mask_v.view(2, self.maxnnz, self.t_d//self.sp_pd, 768)
+        spd = self.d.view(4096, 16, 448)[:, mask_c[self.t_d:]]
+        mask_v = mask_v.view(2, self.maxnnz, self.t_d//self.sp_pd, 448)
         for i in range(self.t_d//self.sp_pd):
         # for i in [0]:
             spr_ref = mask_v[0, :, i] @ spd[:, i].T
@@ -423,7 +423,7 @@ if __name__ == "__main__":
     #     precision=2,        # 保留2位小数
     #     sci_mode=False,     # 不使用科学计数法
     # )
-    hid_dim = 2048
+    hid_dim = 4096
     # cutlass_path = "/share/public/zhouyongkang/projects/sc/deps/cutlass"
     # dsmm_path = "/share/public/zhouyongkang/projects/sc/moe_src"
     # build_path = "/share/public/zhouyongkang/projects/sc/moe_src/build"
@@ -442,14 +442,14 @@ if __name__ == "__main__":
     #     ])
     t_d = 32
     maxnnz = 4
-    for t_d in [64]:
+    for t_d in [8]:
     # for t_d in range(24, 40):
     # for maxnnz in range(1, 9):
         tc = TestCUDAMoe(hid_dim, t_d, maxnnz)
         # tc.test_forward = torch.compile(tc.forward)
         tc.rand_init()
         tc = tc.to('cuda')
-        x = (torch.rand(1, 128, hid_dim, device='cuda', dtype=torch.float16)-0.5) / 2
+        x = (torch.rand(1, 64, hid_dim, device='cuda', dtype=torch.float16)-0.5) / 2
 
         for _ in range(1):
             tc(x)

@@ -98,6 +98,7 @@ sddmm(const T * x, const T * up, const T * gate, T * r,
 #pragma unroll
     for (int i = 0; i < repeat_y; ++i) {
         nz_rows(i) = shmnzp[i];
+        // nz_rows(i) = shmnzp[2*i+idx/64];
     }
     __syncthreads();
 
@@ -181,6 +182,8 @@ sddmm(const T * x, const T * up, const T * gate, T * r,
     // sp s2r
     S2RCopySpAtom s2r_tiled_copy_sp_atom;
     auto tSXsX = local_tile(sX, make_tile(_1{}, _8{}), make_coord(_, _))(0, _, _, _, _);
+    // auto tSUsSU = local_tile(sSU, make_tile(_64{}, _8{}), make_coord(0, _))(idx%64, _, _, _);
+    // auto tSGsSG = local_tile(sSG, make_tile(_64{}, _8{}), make_coord(0, _))(idx%64, _, _, _);
     auto tSUsSU = local_tile(sSU, make_tile(_128{}, _8{}), make_coord(0, _))(idx, _, _, _);
     auto tSGsSG = local_tile(sSG, make_tile(_128{}, _8{}), make_coord(0, _))(idx, _, _, _);
     auto tSXrSX_s2r = local_tile(tCrSX, make_tile(Int<repeat_y>{}, _8{}), make_coord(_, _));
@@ -399,6 +402,7 @@ sddmm(const T * x, const T * up, const T * gate, T * r,
 #pragma unroll
         for (int spy = 0; spy < repeat_y; ++spy) {
             gV(spy, idx, 0) = tCrSR(spy, spx, 0);
+            // gV(2*spy+idx/64, idx%64, 0) = tCrSR(spy, spx, 0);
         }
     }
     __syncthreads();

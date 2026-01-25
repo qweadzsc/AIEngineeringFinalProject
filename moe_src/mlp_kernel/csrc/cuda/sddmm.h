@@ -113,4 +113,104 @@ struct Config {
     static constexpr int kShmSize = shm_size * sizeof(T) + maxnnz * sizeof(long long);
 };
 
+template <typename T_, int kTileM_, int maxnnz_, int kStage_>
+struct Config<T_, kTileM_, 64, 32, 64, maxnnz_, kStage_> {
+    using T = T_;
+    static constexpr int kTileM = kTileM_;
+    static constexpr int kTileN = 64;
+    static constexpr int kTileK = 32;
+    static constexpr int kTileS = 64;
+    static constexpr int maxnnz = maxnnz_;
+    static constexpr int kStage = kStage_;
+
+    static constexpr int sp_per_ds = kTileN / kTileS;
+    static constexpr int repeat_x = kTileS / 64;
+    static constexpr int repeat_y = maxnnz / 2;
+
+    // shm config
+    using SmemLayoutAtom = decltype(composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(make_shape(Int<512/kTileK>{}, Int<kTileK>{}), make_stride(Int<kTileK>{}, _1{}))
+    ));
+    using SmemLayoutX = decltype(tile_to_shape(
+        SmemLayoutAtom{}, make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})
+    ));
+    using SmemLayoutUp = decltype(tile_to_shape(
+        SmemLayoutAtom{}, make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})
+    ));
+    using SmemLayoutGate = decltype(tile_to_shape(
+        SmemLayoutAtom{}, make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStage>{})
+    ));
+    using SmemLayoutSpUp = decltype(tile_to_shape(
+        SmemLayoutAtom{}, make_shape(Int<kTileS>{}, Int<kTileK>{}, Int<kStage>{})
+    ));
+    using SmemLayoutSpGate = decltype(tile_to_shape(
+        SmemLayoutAtom{}, make_shape(Int<kTileS>{}, Int<kTileK>{}, Int<kStage>{})
+    ));
+
+    // g2s config
+    using g2s_copy_op = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
+    using g2s_copy_traits = Copy_Traits<g2s_copy_op>;
+    using g2s_copy_atom = Copy_Atom<g2s_copy_traits, T>;
+
+    using G2SCopyX = decltype(make_tiled_copy(
+        g2s_copy_atom{},
+        make_layout(make_shape(Int<1024/kTileK>{}, Int<kTileK/8>{}),
+                    make_stride(Int<kTileK/8>{}, Int<1>{})),
+        make_layout(make_shape(Int<1>{}, Int<8>{}))
+    ));
+    using G2SCopyUp = G2SCopyX;
+    using G2SCopyGate = G2SCopyX;
+    using G2SCopySpUp = G2SCopyX;
+    using G2SCopySpGate = G2SCopyX;
+
+    // s2r config
+    using s2r_copy_op = SM75_U32x4_LDSM_N;
+    using s2r_copy_atom = Copy_Atom<Copy_Traits<s2r_copy_op>, T>;
+
+    using S2RCopyAtomX = s2r_copy_atom;
+    using S2RCopyAtomUp = s2r_copy_atom;
+    using S2RCopyAtomGate = s2r_copy_atom;
+    using S2RCopySpAtom = Copy_Atom<UniversalCopy<cute::uint128_t>, T>;
+
+    // cal config
+    using mma_op = SM80_16x8x16_F16F16F16F16_TN;
+    using mma_traits = MMA_Traits<mma_op>;
+    using mma_atom = MMA_Atom<mma_traits>;
+    using MMA = decltype(make_tiled_mma(
+        mma_atom{}, make_layout(make_shape(_2{}, _2{}, _1{})),
+        Tile<_32, _32, _16>{}
+    ));
+
+    // r2s config
+    static constexpr int kSmemLayoutCBatch = 2;
+    using SmemLayoutAtomResult = decltype(composition(
+        Swizzle<2, 3, 3>{},
+        make_layout(make_shape(Int<32>{}, Int<32>{}),
+                    make_stride(Int<32>{}, Int<1>{}))
+    ));
+    using SmemLayoutResult = decltype(tile_to_shape(
+        SmemLayoutAtomResult{},
+        make_shape(Int<32>{}, Int<32>{}, Int<kSmemLayoutCBatch>{})
+    ));
+    using R2SCopyAtomR = Copy_Atom<UniversalCopy<int>, T>;
+
+    // s2g config
+    using S2GCopyAtomR = Copy_Atom<UniversalCopy<cute::uint128_t>, T>;
+    using S2GCopyR = decltype(make_tiled_copy(
+        S2GCopyAtomR{},
+        make_layout(make_shape(Int<32>{}, Int<4>{}),
+                    make_stride(Int<4>{}, Int<1>{})),
+        make_layout(make_shape(Int<1>{}, Int<8>{}))
+    ));
+
+    // other config
+    static constexpr int shm_size = cute::cosize(SmemLayoutX{}) +
+                                    cute::cosize(SmemLayoutUp{}) +
+                                    cute::cosize(SmemLayoutGate{}) +
+                                    cute::cosize(SmemLayoutSpUp{}) +
+                                    cute::cosize(SmemLayoutSpGate{});
+    static constexpr int kShmSize = shm_size * sizeof(T) + maxnnz * sizeof(long long);
+};
+
 }
