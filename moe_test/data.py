@@ -2,10 +2,61 @@ from datasets import load_dataset
 import torch
 from torch.utils.data import Dataset
 import logging
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+BENCHMARK_ROOT = PROJECT_ROOT / "benchmark"
+LEGACY_BENCHMARK_ROOT = PROJECT_ROOT / "data" / "benchmark"
+
+
+def resolve_dataset_path(dataset_name_or_path):
+    dataset_str = str(dataset_name_or_path)
+    raw_path = Path(dataset_str).expanduser()
+    candidates = []
+
+    def add_candidate(candidate: Path) -> None:
+        candidate_str = str(candidate)
+        if candidate_str not in seen_candidates:
+            seen_candidates.add(candidate_str)
+            candidates.append(candidate)
+
+    seen_candidates = set()
+
+    add_candidate(raw_path)
+    if not raw_path.is_absolute():
+        add_candidate(PROJECT_ROOT / raw_path)
+
+    if dataset_str.startswith("benchmark/"):
+        suffix = dataset_str.split("benchmark/", 1)[1]
+        add_candidate(BENCHMARK_ROOT / suffix)
+        add_candidate(LEGACY_BENCHMARK_ROOT / suffix)
+    elif dataset_str.startswith("data/benchmark/"):
+        suffix = dataset_str.split("data/benchmark/", 1)[1]
+        add_candidate(BENCHMARK_ROOT / suffix)
+        add_candidate(LEGACY_BENCHMARK_ROOT / suffix)
+    elif len(raw_path.parts) == 1:
+        add_candidate(BENCHMARK_ROOT / dataset_str)
+        add_candidate(LEGACY_BENCHMARK_ROOT / dataset_str)
+
+    if raw_path.is_absolute():
+        raw_posix = raw_path.as_posix()
+        if "/data/benchmark/" in raw_posix:
+            suffix = raw_posix.split("/data/benchmark/", 1)[1]
+            add_candidate(BENCHMARK_ROOT / suffix)
+        elif "/benchmark/" in raw_posix:
+            suffix = raw_posix.split("/benchmark/", 1)[1]
+            add_candidate(BENCHMARK_ROOT / suffix)
+            add_candidate(LEGACY_BENCHMARK_ROOT / suffix)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+
+    return dataset_str
 
 class CustomTextDataset(Dataset):
     """Generic dataset class to handle different datasets based on their structure."""
@@ -20,8 +71,9 @@ class CustomTextDataset(Dataset):
                                         If None, attempts to find a default split.
             **kwargs: Additional arguments to pass to load_dataset.
         """
-        logger.info(f"Loading dataset from {dataset_name_or_path}")
-        self.dataset = load_dataset(dataset_name_or_path, **kwargs)
+        resolved_dataset_name_or_path = resolve_dataset_path(dataset_name_or_path)
+        logger.info(f"Loading dataset from {resolved_dataset_name_or_path}")
+        self.dataset = load_dataset(resolved_dataset_name_or_path, **kwargs)
         
         # Determine the split to use
         if split_name and split_name in self.dataset:
@@ -40,30 +92,31 @@ class CustomTextDataset(Dataset):
         
         # Determine the prompt generation function based on the dataset path or name
         # This is a simple heuristic; in practice, you might need a more robust mapping
-        if 'alpaca' in dataset_name_or_path.lower():
+        dataset_id = str(resolved_dataset_name_or_path).lower()
+        if 'alpaca' in dataset_id:
             self.prompt_func = self._get_alpaca_prompt
-        elif 'commonsense_qa' in dataset_name_or_path.lower() or 'csqa' in dataset_name_or_path.lower():
+        elif 'commonsense_qa' in dataset_id or 'csqa' in dataset_id:
              # Note: The actual Hugging Face dataset might be named 'tau/commonsense_qa'
              # Adjust the check as needed based on how you load it.
              # The original CSQA dataset structure is followed by some versions.
             self.prompt_func = self._get_csqa_prompt
-        elif 'gsm8k' in dataset_name_or_path.lower():
+        elif 'gsm8k' in dataset_id:
             self.prompt_func = self._get_gsm8k_prompt
-        elif 'hellaswag' in dataset_name_or_path.lower():
+        elif 'hellaswag' in dataset_id:
             self.prompt_func = self._get_hellaswag_prompt
-        elif 'piqa' in dataset_name_or_path.lower():
+        elif 'piqa' in dataset_id:
             self.prompt_func = self._get_piqa_prompt
-        elif 'siqa' in dataset_name_or_path.lower():
+        elif 'siqa' in dataset_id:
             self.prompt_func = self._get_siqa_prompt
-        elif 'sst2' in dataset_name_or_path.lower() or 'sst-2' in dataset_name_or_path.lower():
+        elif 'sst2' in dataset_id or 'sst-2' in dataset_id:
             self.prompt_func = self._get_sst2_prompt
-        elif 'sum' in dataset_name_or_path.lower(): # Assuming 'sum' is the identifier
+        elif 'sum' in dataset_id: # Assuming 'sum' is the identifier
             self.prompt_func = self._get_sum_prompt
         else:
             # Default to a generic function that tries common fields
             self.prompt_func = self._get_generic_prompt
         
-        logger.info(f"Using prompt generation function for dataset: {dataset_name_or_path}")
+        logger.info(f"Using prompt generation function for dataset: {resolved_dataset_name_or_path}")
 
     def _get_alpaca_prompt(self, idx):
         """Generates a prompt for the Alpaca dataset using the 'instruction' field."""

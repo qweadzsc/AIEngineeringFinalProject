@@ -3,7 +3,7 @@ import time
 import argparse
 import os
 # Assuming data.py is in the same directory or in the Python path
-from data import CustomTextDataset 
+from data import CustomTextDataset, resolve_dataset_path
 from tqdm import tqdm
 from EAGLE.eagle.model.ea_model import EaModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -128,7 +128,7 @@ def main():
         raise ValueError(f"Dataset index {args.dataset} is out of range for list of {len(datasets_names)} datasets.")
         
     dataset_name = datasets_names[args.dataset]
-    dataset_path = f'/share/zhouyongkang/projects/sc/data/benchmark/{dataset_name}'
+    dataset_path = resolve_dataset_path(f'benchmark/{dataset_name}')
     print(f"Loading dataset: {dataset_name} from {dataset_path}")
     
     if not os.path.exists(dataset_path):

@@ -5,6 +5,7 @@ from tqdm import tqdm
 from EAGLE.eagle.model.ea_model import EaModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from mlp import SPMLP
+from data import resolve_dataset_path
 
 torch.cuda.reset_peak_memory_stats()
 
@@ -36,7 +37,7 @@ def run_eagle_generation(model, input_ids, max_new_tokens):
     return output_ids, al
 
 
-dataset = load_dataset('/share/public/zhouyongkang/projects/sc/data/benchmark/alpaca')
+dataset = load_dataset(resolve_dataset_path('benchmark/alpaca'))
 split_name = 'train' if 'train' in dataset else list(dataset.keys())[0]
 dataset_split = dataset[split_name]
 
