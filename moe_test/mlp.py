@@ -36,7 +36,7 @@ def print_diff(tensor1, tensor2, eps=3e-3):
 
 
 class SPMLP(nn.Module):
-    def __init__(self, origin_mlp, t_d=None):
+    def __init__(self, origin_mlp, t_d=None, forward_mode="main"):
         super().__init__()
 
         with torch.no_grad():
@@ -79,6 +79,9 @@ class SPMLP(nn.Module):
 
         self.gate = origin_mlp.gate
         self.t_d = self.num_experts // 2 if t_d is None else t_d
+        if forward_mode not in {"main", "bm"}:
+            raise ValueError(f"Unsupported forward mode: {forward_mode}")
+        self.forward_mode = forward_mode
         
     def opt_mixer(self, router_logits):
         top_k_values, top_k_indices = torch.topk(router_logits, self.top_k, dim=1)
@@ -143,7 +146,7 @@ class SPMLP(nn.Module):
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
     
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def main_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         x = hidden_states.view(-1, hidden_dim)
         bs = x.size(0)
@@ -217,3 +220,8 @@ class SPMLP(nn.Module):
         final_hidden_states = weighted_outputs.sum(dim=1)
 
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_logits
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.forward_mode == "bm":
+            return self.bm_forward(hidden_states)
+        return self.main_forward(hidden_states)

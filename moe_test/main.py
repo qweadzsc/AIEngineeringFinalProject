@@ -116,9 +116,9 @@ def main():
     parser = argparse.ArgumentParser(description="Run LLM generation with different methods.")
     parser.add_argument("--dataset", type=int, default=7, 
                         help="Index of the dataset in ['alpaca', 'commonsense_qa', 'gsm8k', 'hellaswag', 'piqa', 'siqa', 'sst2', 'sum'] (default: 7)")
-    parser.add_argument("--method", type=str, default='hf', choices=['hf', 'eagle', 'mtp', 'deepspeed', 'bm'],
-                        help="Generation method: hf (HuggingFace), eagle, mtp, bm, or deepspeed (default: hf)")
-    parser.add_argument("--num_prompts", type=int, default=100000,
+    parser.add_argument("--method", type=str, default='hf', choices=['hf', 'eagle', 'mtp', 'deepspeed', 'bm', 'bmeagle'],
+                        help="Generation method: hf (HuggingFace), eagle, mtp, bm, bmeagle, or deepspeed (default: hf)")
+    parser.add_argument("--num_prompts", type=int, default=10,
                         help="Number of prompts to process (default: all)")
     args = parser.parse_args()
 
@@ -128,7 +128,7 @@ def main():
         raise ValueError(f"Dataset index {args.dataset} is out of range for list of {len(datasets_names)} datasets.")
         
     dataset_name = datasets_names[args.dataset]
-    dataset_path = f'。/data/benchmark/{dataset_name}'
+    dataset_path = f'/share/zhouyongkang/projects/sc/data/benchmark/{dataset_name}'
     print(f"Loading dataset: {dataset_name} from {dataset_path}")
     
     if not os.path.exists(dataset_path):
@@ -174,7 +174,7 @@ def main():
         model.device = model.base_model.device
         tokenizer = model.tokenizer
 
-    elif generation_method == 'mtp' or generation_method == 'bm':
+    elif generation_method == 'mtp' or generation_method == 'bm' or generation_method == "bmeagle":
         print(f"Loading EAGLE model with base {base_model_path} and EA model {EAGLE_model_path} for MTP...")
         model = EaModel.from_pretrained(
             base_model_path=base_model_path,
@@ -187,8 +187,9 @@ def main():
         )
         model.eval()
         model.device = model.base_model.device
-        for layer in tqdm(model.base_model.model.layers, desc="Applying SPMLP to layers"):
-            layer.mlp = SPMLP(layer.mlp)
+        forward_mode = "bm" if generation_method in {"bm", "bmeagle"} else "main"
+        for layer in tqdm(model.base_model.model.layers, desc=f"Applying SPMLP ({forward_mode}) to layers"):
+            layer.mlp = SPMLP(layer.mlp, forward_mode=forward_mode)
         tokenizer = model.tokenizer
 
     elif generation_method == 'deepspeed':
@@ -213,7 +214,7 @@ def main():
             if generation_method == 'hf':
                 output_ids = run_hf_generation(model, tokenizer, input_ids, max_new_tokens=128)
                 al_mean = 0.0
-            elif generation_method == 'eagle' or generation_method == 'mtp':
+            elif generation_method == 'eagle' or generation_method == 'mtp' or generation_method == 'bmeagle':
                 output_ids, al = run_eagle_generation(model, input_ids, max_new_tokens=128)
                 al_tensor = torch.as_tensor(al).float()
                 al_mean = al_tensor.mean().item()

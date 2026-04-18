@@ -40,7 +40,7 @@ fastapi-cloud-cli==0.1.5
 fastchat==0.1.0
 fastrlock==0.8.3
 filelock==3.18.0
-flash_attn==2.7.3
+# flash_attn==2.7.3
 fonttools==4.59.0
 frozenlist==1.7.0
 fsspec==2025.3.0

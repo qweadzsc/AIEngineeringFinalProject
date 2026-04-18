@@ -20,7 +20,7 @@ sources = [
     "./mlp_kernel/csrc/cuda/spmm.cu",
 ]
 
-cutlass_path = "/path/to/your/cutlass/"
+cutlass_path = "/share/zhouyongkang/projects/sc/deps/cutlass"
 include_dirs = [
     '.',
     extensions_cuda_dir,
