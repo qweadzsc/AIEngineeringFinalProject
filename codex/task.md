@@ -28,7 +28,7 @@ The first design change is to split this into two independent knobs, for example
 | Step | Work | Expected Output | Validation |
 | --- | --- | --- | --- |
 | 1 | [Done] Freeze the new semantics and tensor layout. Define independent `dense_width` and `sparse_width`, decide whether dense and sparse expert indices stay concatenated or are carried as separate tensors, and define the output layout for dense `ir` and sparse `mask_v`. | A small design section in code comments plus a shared metadata builder API, likely in a new Triton-side helper module. | Shape assertions for `mask_c_dense`, `mask_c_sparse`, `mask_r_sparse`, `ir_dense`, and `mask_v_sparse`; verify `sparse_width = 0` is legal. |
-| 2 | Build a pure PyTorch reference oracle for the new behavior. This reference should compute `ref = (x @ up.T) * silu(x @ gate.T)` first, then slice dense columns and sparse sampled rows exactly according to the new metadata. | A reference implementation in a new test/helper file, likely under `moe_src/test/`. | Compare dense slices and sparse sampled slices against the full dense reference for multiple `(bs, dense_width, sparse_width, maxnnz)` combinations. |
+| 2 | [Done] Build a pure PyTorch reference oracle for the new behavior. This reference should compute `ref = (x @ up.T) * silu(x @ gate.T)` first, then slice dense columns and sparse sampled rows exactly according to the new metadata. | A reference implementation in a new test/helper file, likely under `moe_src/test/`. | Compare dense slices and sparse sampled slices against the full dense reference for multiple `(bs, dense_width, sparse_width, maxnnz)` combinations. |
 | 3 | Implement a Triton mixed SDDMM prototype. One launch grid covers both dense and sparse regions. Each block derives its region from `program_id`, then dispatches to either the dense path or sparse path. | A new Triton kernel module, likely `moe_src/triton/mixed_sddmm.py`. | For small shapes, compare Triton outputs against the PyTorch oracle with max-abs-diff and mismatch-count checks. Include cases `sparse_width > dense_width`, `sparse_width < dense_width`, and `sparse_width = 0`. |
 | 4 | Implement dense-region block mapping and tensor-core compute. Dense blocks should read contiguous `x` and weight tiles and use Triton `dot` patterns that lower to tensor cores on fp16/bf16-capable GPUs. | Dense path in the Triton kernel plus launch-time block-count calculation. | Inspect output correctness first, then benchmark dense-only cases against the current dense baseline. The acceptance target is that the `sparse_width = 0` mode is not slower than the baseline by an unacceptable margin. |
 | 5 | Implement sparse-region block mapping and exact sparse memory access. Sparse blocks should load only the selected token rows from `mask_r_sparse` and only the selected expert blocks from `mask_c_sparse`, without materializing full dense intermediate tiles. | Sparse path in the Triton kernel plus sparse metadata preparation helpers. | Validate that sparse outputs match the oracle exactly on sampled rows. Confirm no extra dense-sized temporary tensor is allocated for the sparse path. |
@@ -51,10 +51,45 @@ Step 1 is complete in the current branch.
   - disjoint dense/sparse expert selections
   - sparse row-topk selection
   - `sparse_width = 0`
+- The Step 1 metadata test is now device-parameterized and runs on:
+  - CPU
+  - CUDA, when available
+
+## Step 2 Completion Notes
+
+Step 2 is complete in the current branch.
+
+- Added a pure PyTorch oracle in `moe_src/sddmm_validation/mixed_sddmm_reference.py`.
+- The oracle first materializes the full intermediate as:
+  - `full_intermediate[batch, num_experts, expert_block_size] = (x @ up.T) * silu(x @ gate.T)`
+- Dense outputs are then sliced as:
+  - `ir_dense[:, dense_slot, :] = full_intermediate[:, mask_c_dense[dense_slot], :]`
+- Sparse outputs are gathered exactly as:
+  - `mask_v_sparse[row_slot, sparse_slot, :] = full_intermediate[mask_r_sparse[row_slot, sparse_slot], mask_c_sparse[sparse_slot], :]`
+- Exported the new reference helpers from `moe_src/sddmm_validation/__init__.py`.
+- Added `moe_src/test/test_mixed_sddmm_reference.py` to validate multiple `(bs, dense_width, sparse_width, maxnnz)` combinations, including:
+  - `sparse_width = 0`
+  - `sparse_width < dense_width`
+  - `sparse_width > dense_width`
+- The Step 2 reference test is now device-parameterized and runs on:
+  - CPU
+  - CUDA, when available
+
+## Test Runner Notes
+
+- `moe_src/run_test.sh` now treats the Step 1 and Step 2 pure-PyTorch tests as the default test set.
+- Those default tests execute on CPU first and also cover CUDA automatically when CUDA is available.
+- GPU-backed extension tests remain separate and are only run when CUDA is available.
+- `moe_src/test/test_oss.py` is intentionally kept as a legacy reference script, but it is not part of the default regression path and is skipped by `moe_src/run_test.sh`.
 
 ## Current Validation Status
 
 - `python moe_src/test/test_mixed_sddmm_metadata.py` passes.
+- `python -m unittest moe_src.test.test_mixed_sddmm_metadata moe_src.test.test_mixed_sddmm_reference` passes.
+  - when CUDA is available, this exercises both the CPU and CUDA paths for Step 1 and Step 2
+- `CUDA_VISIBLE_DEVICES=-1 bash moe_src/run_test.sh` passes.
+  - this confirms the default pure-PyTorch tests run correctly in CPU-only mode
+  - this also confirms `test/test_oss.py` is reported as a skipped legacy non-default test
 - `bash moe_src/run.sh` now defaults to `CUDA_VISIBLE_DEVICES=6`, rebuilds the extension, and runs the active test set.
 - `moe_src/test/test.py` was updated to:
   - remove the stale `transformers` dependency
