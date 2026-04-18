@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
-from transformers.activations import ACT2FN
 
 import mlp_kernel
 
@@ -31,12 +30,17 @@ def print_dif(x, y, eps=1e-5, print_it=True):
     return different_count, total_elements, max_diff
 
 
-def print_dense_dif(x, y, mask_c, eps=1e-5):
+def print_dense_dif(x, y, mask_c, expert_w, eps=1e-5):
     diff = []
     total_elements = 0
     different_count = 0
     for i, c in enumerate(mask_c):
-        dc, te, md = print_dif(x[:, i*448:(i+1)*448], y[:, c*448:(c+1)*448], eps=eps, print_it=False)
+        dc, te, md = print_dif(
+            x[:, i*expert_w:(i+1)*expert_w],
+            y[:, c*expert_w:(c+1)*expert_w],
+            eps=eps,
+            print_it=False,
+        )
         diff.append(md)
         total_elements += te
         different_count += dc
@@ -46,19 +50,19 @@ def print_dense_dif(x, y, mask_c, eps=1e-5):
     print(f"Maximum absolute difference: {max_diff:.6e}")
 
 
-def print_select_dif(x, y, mask_r, mask_c, eps=1e-5):
+def print_select_dif(x, y, mask_r, mask_c, expert_w, eps=1e-5):
     mn = x.shape[0]
     sp = mask_c.shape[0]
-    asp = y.shape[1] // 448
-    x_reshaped = x.view(mn, sp, 448)
-    y_reshaped = y.view(-1, asp, 448)
-    sy = y_reshaped[:, mask_c, :]  # shape: [64, sp, 768]
+    asp = y.shape[1] // expert_w
+    x_reshaped = x.view(mn, sp, expert_w)
+    y_reshaped = y.view(-1, asp, expert_w)
+    sy = y_reshaped[:, mask_c, :]
     
     i_indices = torch.arange(mn)[:, None]  # shape: [mn, 1]
     j_indices = torch.arange(sp)[None, :]  # shape: [1, sp]
 
-    x_selected = x_reshaped[i_indices, j_indices]  # shape: [mn, sp, 768]
-    sy_selected = sy[mask_r, j_indices]            # shape: [mn, sp, 768]
+    x_selected = x_reshaped[i_indices, j_indices]
+    sy_selected = sy[mask_r, j_indices]
 
     diff = torch.abs(x_selected - sy_selected)
 
@@ -95,7 +99,7 @@ class MLP(nn.Module):
                                    dtype=dtype, device='cuda')
         self.down_proj = nn.Linear(self.inter_dim, self.hid_dim, bias=bias,
                                    dtype=dtype, device='cuda')
-        self.act_fn = ACT2FN["silu"]
+        self.act_fn = F.silu
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -106,6 +110,7 @@ class TestCUDAMoe(nn.Module):
     def __init__(self, hid_dim, t_d, maxnnz, cuda_module=None):
         super().__init__()
         self.num_experts = 16
+        self.expert_w = 512
         self.top_k = 2
         self.norm_topk_prob = True
         self.cuda_module = cuda_module
@@ -118,14 +123,82 @@ class TestCUDAMoe(nn.Module):
 
         self.gate = nn.Linear(hid_dim, 16, bias=False, dtype=torch.float16)
         self.experts = nn.ModuleList(
-            [MLP(hid_dim, 448) for _ in range(self.num_experts)]
+            [MLP(hid_dim, self.expert_w) for _ in range(self.num_experts)]
         )
-        self.single = MLP(hid_dim, 448*16, bias=False, dtype=torch.float16)
+        self.single = MLP(hid_dim, self.expert_w * self.num_experts, bias=False, dtype=torch.float16)
         self.u = self.single.up_proj.weight.data
         self.g = self.single.gate_proj.weight.data
         self.d = self.single.down_proj.weight.data
         
         self.data = []
+
+    def build_full_reference(self, x: torch.Tensor) -> torch.Tensor:
+        return (x @ self.u.T) * self.single.act_fn(x @ self.g.T)
+
+    def build_full_moe_output(self, ref_ir: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
+        ref = torch.zeros(ref_ir.shape[0], self.hid_dim, dtype=ref_ir.dtype, device=ref_ir.device)
+        for expert_idx in range(self.num_experts):
+            start = expert_idx * self.expert_w
+            end = start + self.expert_w
+            ref += (ref_ir[:, start:end] @ self.d[:, start:end].T) * routing_weights[:, expert_idx].unsqueeze(1)
+        return ref
+
+    def build_selected_oracle_output(
+        self,
+        ref_ir: torch.Tensor,
+        routing_weights: torch.Tensor,
+        mask_c: torch.Tensor,
+        mask_r: torch.Tensor,
+    ) -> torch.Tensor:
+        ref = torch.zeros(ref_ir.shape[0], self.hid_dim, dtype=ref_ir.dtype, device=ref_ir.device)
+
+        for c in mask_c[:self.t_d]:
+            start = c * self.expert_w
+            end = start + self.expert_w
+            ref += (ref_ir[:, start:end] @ self.d[:, start:end].T) * routing_weights[:, c].unsqueeze(1)
+
+        for i, c in enumerate(mask_c[self.t_d:]):
+            start = c * self.expert_w
+            end = start + self.expert_w
+            spr_ref = ref_ir[mask_r[:, i], start:end] @ self.d[:, start:end].T
+            for j in range(self.maxnnz):
+                row = mask_r[j, i]
+                ref[row] += spr_ref[j] * routing_weights[row, c]
+
+        return ref
+
+    def build_spmm_replay_output(
+        self,
+        ir: torch.Tensor,
+        mask_v: torch.Tensor,
+        routing_weights: torch.Tensor,
+        mask_c: torch.Tensor,
+        mask_r: torch.Tensor,
+    ) -> torch.Tensor:
+        ref = torch.zeros(ir.shape[0], self.hid_dim, dtype=ir.dtype, device=ir.device)
+        for i, c in enumerate(mask_c[:self.t_d]):
+            start = i * self.expert_w
+            end = start + self.expert_w
+            ref += (ir[:, start:end] @ self.d[:, c*self.expert_w:(c+1)*self.expert_w].T) * \
+                routing_weights[:, c].unsqueeze(1)
+
+        spd = self.d.view(self.hid_dim, self.num_experts, self.expert_w)[:, mask_c[self.t_d:]]
+        mask_v_view = mask_v.view(self.maxnnz, self.t_d // self.sp_pd, self.expert_w)
+        for i in range(self.t_d // self.sp_pd):
+            spr_ref = mask_v_view[:, i] @ spd[:, i].T
+            for j in range(self.maxnnz):
+                ref[mask_r[j, i]] += spr_ref[j] * routing_weights[mask_r[j, i], mask_c[self.t_d + i]]
+        return ref
+
+    def report_layout_assumption(self) -> None:
+        sddmm_output_tile = 128
+        if self.expert_w % sddmm_output_tile != 0:
+            print(
+                f"WARNING: expert_w={self.expert_w} is not divisible by the current "
+                f"sddmm output tile {sddmm_output_tile}. The kernel writes dense/sparse "
+                "intermediates in 128-column tiles, so the intermediate buffer layout is "
+                "not aligned with the configured expert stride."
+            )
     
     def rand_init(self):
         self.gate.weight.data = torch.rand_like(self.gate.weight) / 5
@@ -157,10 +230,10 @@ class TestCUDAMoe(nn.Module):
         routing_weights.scatter_(1, routing_weights_top8.indices, routing_weights_top8.values)
         routing_weights = routing_weights.to(x.dtype)
         
-        ir = torch.zeros(bs, self.t_d*768, dtype=x.dtype, device=x.device)
+        ir = torch.zeros(bs, self.t_d * self.expert_w, dtype=x.dtype, device=x.device)
         mask_c = torch.topk(routing_weights[:, self.t_d:].sum(0), self.t_d // self.sp_pd).indices
         routing_sc, mask_r = routing_weights[:, mask_c+self.t_d].topk(self.maxnnz, dim=0)
-        mask_v = torch.zeros(self.maxnnz, (self.t_d//self.sp_pd)*768,
+        mask_v = torch.zeros(self.maxnnz, (self.t_d // self.sp_pd) * self.expert_w,
                              dtype=x.dtype, device=x.device)
         result = torch.zeros(self.t_d, bs, self.hid_dim, dtype=x.dtype, device=x.device)
             
@@ -172,11 +245,11 @@ class TestCUDAMoe(nn.Module):
 
         self.cuda_module.torch_launch_sddmm_kernel(
             x, self.u, self.g, ir, mask_r, mask_c, mask_v,
-            bs, hidden_dim, 128*768, 768, self.t_d)
+            bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, self.t_d, self.maxnnz)
 
         self.cuda_module.torch_launch_spmm_kernel(
             ir, self.d, result, mask_r, mask_c, mask_v, routing_weights,
-            bs, hidden_dim, 128*768, 768, self.t_d)
+            bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, self.t_d, self.maxnnz)
         
         x = result.sum(0)
         
@@ -236,22 +309,24 @@ class TestCUDAMoe(nn.Module):
             routing_n = torch.count_nonzero(routing_weights, dim=0)
             t_d, maxnnz = self.t_d, self.maxnnz
 
-            ir = torch.zeros(2, bs, t_d*448, dtype=x.dtype, device=x.device)
+            self.report_layout_assumption()
+
+            ir = torch.zeros(bs, t_d * self.expert_w, dtype=x.dtype, device=x.device)
             mask_c = torch.topk(routing_n, t_d // self.sp_pd + t_d).indices
             mask_r = sparse_routing_weights[:, mask_c[t_d:]].topk(maxnnz, dim=0).indices
-            mask_v = torch.zeros(2, maxnnz, (t_d//self.sp_pd)*448,
-                                dtype=x.dtype, device=x.device)
+            mask_v = torch.zeros(maxnnz, (t_d // self.sp_pd) * self.expert_w,
+                                 dtype=x.dtype, device=x.device)
             result = torch.zeros(t_d, bs, self.hid_dim, dtype=x.dtype, device=x.device)
         
             start_event.record()
 
             mlp_kernel.ops.sddmm(
                 x, self.u, self.g, ir, mask_r, mask_c, mask_v,
-                bs, hidden_dim, 16*448, 448, t_d, maxnnz)
+                bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, t_d, maxnnz)
 
             mlp_kernel.ops.spmm(
-                ir[0], self.d, result, mask_r, mask_c, mask_v[0], routing_weights,
-                bs, hidden_dim, 16*448, 448, t_d, maxnnz)
+                ir, self.d, result, mask_r, mask_c, mask_v, routing_weights,
+                bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, t_d, maxnnz)
             
             x = result.sum(0)
         
@@ -265,23 +340,23 @@ class TestCUDAMoe(nn.Module):
             avg_time = sum(warmup_data) / len(warmup_data)
             print(f"Average time for iterations {501}-{len(self.data)}: {avg_time:.4f} ms")
         
-        ref = (x_ref @ self.u.T) * self.single.act_fn(x_ref @ self.g.T)
-        print_dense_dif(ir[0], ref, mask_c[:self.t_d], ref.abs().max()/200)
-        print_select_dif(mask_v[0], ref, mask_r, mask_c[self.t_d:], ref.abs().max()/200)
+        ref = self.build_full_reference(x_ref)
+        print("Dense SDDMM vs PyTorch oracle:")
+        print_dense_dif(ir, ref, mask_c[:self.t_d], self.expert_w, ref.abs().max()/200)
+        print("Sparse SDDMM vs PyTorch oracle:")
+        print_select_dif(mask_v, ref, mask_r, mask_c[self.t_d:], self.expert_w, ref.abs().max()/200)
 
-        ref = torch.zeros_like(x)
-        for i, c in enumerate(mask_c[:self.t_d]):
-            ref += (ir[0, :, i*448:(i+1)*448] @ self.d[:, c*448:(c+1)*448].T) * \
-                routing_weights[:, c].unsqueeze(1)
-        spd = self.d.view(4096, 16, 448)[:, mask_c[self.t_d:]]
-        mask_v = mask_v.view(2, self.maxnnz, self.t_d//self.sp_pd, 448)
-        for i in range(self.t_d//self.sp_pd):
-        # for i in [0]:
-            spr_ref = mask_v[0, :, i] @ spd[:, i].T
-            for j in range(self.maxnnz):
-                ref[mask_r[j, i]] += spr_ref[j] * \
-                    routing_weights[mask_r[j, i], mask_c[self.t_d+i]]
-        print_dif(x, ref, ref.abs().max()/200)
+        replay_ref = self.build_spmm_replay_output(ir, mask_v, routing_weights, mask_c, mask_r)
+        print("End-to-end replay using kernel intermediates:")
+        print_dif(x, replay_ref, replay_ref.abs().max()/200)
+
+        selected_oracle_ref = self.build_selected_oracle_output(ref, routing_weights, mask_c, mask_r)
+        print("End-to-end selected-row oracle:")
+        print_dif(x, selected_oracle_ref, selected_oracle_ref.abs().max()/200)
+
+        full_oracle_ref = self.build_full_moe_output(ref, routing_weights)
+        print("End-to-end full MoE oracle:")
+        print_dif(x, full_oracle_ref, full_oracle_ref.abs().max()/200)
 
         return x.view(batch_size, sequence_length, hidden_dim)
     
@@ -306,11 +381,11 @@ class TestCUDAMoe(nn.Module):
         routing_weights = routing_weights.to(x.dtype)
         routing_weights /= routing_weights.sum(-1, keepdim=True)
             
-        ir = torch.zeros(nt, bs, self.t_d*768, dtype=x.dtype, device=x.device)
+        ir = torch.zeros(nt, bs, self.t_d * self.expert_w, dtype=x.dtype, device=x.device)
         mask_c = torch.topk((routing_weights!=0).to(torch.float32).sum(1),
                             self.t_d // self.sp_pd + self.t_d).indices
         mask_c_extra = mask_c[:, None, self.t_d:]  # shape: (nt, 1, t_d//sp_pd)
-        mask_v = torch.zeros(nt, self.maxnnz, (self.t_d//self.sp_pd)*768,
+        mask_v = torch.zeros(nt, self.maxnnz, (self.t_d // self.sp_pd) * self.expert_w,
                              dtype=x.dtype, device=x.device)
         buf = min(self.t_d, 4096//nt)
         result = torch.zeros(buf, nt, bs, self.hid_dim, dtype=x.dtype, device=x.device)
@@ -324,11 +399,11 @@ class TestCUDAMoe(nn.Module):
 
         self.cuda_module.torch_launch_sddmm_kernel(
             x, self.u, self.g, ir, mask_r, mask_c, mask_v,
-            nt*bs, hidden_dim, 128*768, 768, self.t_d, self.maxnnz)
+            nt * bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, self.t_d, self.maxnnz)
 
         self.cuda_module.torch_launch_spmm_kernel(
             ir, self.d, result, mask_r, mask_c, mask_v, routing_weights,
-            nt*bs, hidden_dim, 128*768, 768, self.t_d, self.maxnnz)
+            nt * bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, self.t_d, self.maxnnz)
         
         x = result.sum(0)
         
@@ -378,9 +453,10 @@ class TestCUDAMoe(nn.Module):
         router_logits = self.gate(x)
         routing_weights = F.softmax(router_logits, dim=1, dtype=x.dtype)
 
-        ir = x @ self.u[:32*768].T * self.single.act_fn(x @ self.g[:32*768].T)
+        dense_mid = self.num_experts * self.expert_w
+        ir = x @ self.u[:dense_mid].T * self.single.act_fn(x @ self.g[:dense_mid].T)
 
-        x = ir @ self.d.T[:32*768]
+        x = ir @ self.d.T[:dense_mid]
                 
         return x
     

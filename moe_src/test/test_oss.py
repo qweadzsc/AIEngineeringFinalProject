@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
-from transformers.activations import ACT2FN
 
 import mlp_kernel
 
@@ -95,7 +94,7 @@ class MLP(nn.Module):
                                    dtype=dtype, device='cuda')
         self.down_proj = nn.Linear(self.inter_dim, self.hid_dim, bias=bias,
                                    dtype=dtype, device='cuda')
-        self.act_fn = ACT2FN["silu"]
+        self.act_fn = F.silu
 
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
