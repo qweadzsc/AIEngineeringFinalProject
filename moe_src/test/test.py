@@ -248,9 +248,6 @@ class TestCUDAMoe(nn.Module):
             mlp_kernel.ops.sddmm(
                 x, self.u, self.g, ir, mask_r, mask_c, mask_v,
                 bs, hidden_dim, 16*448, 448, t_d, maxnnz)
-            
-            ir[0] *= torch.sigmoid(ir[1])
-            mask_v[0] *= torch.sigmoid(mask_v[1])
 
             mlp_kernel.ops.spmm(
                 ir[0], self.d, result, mask_r, mask_c, mask_v[0], routing_weights,
