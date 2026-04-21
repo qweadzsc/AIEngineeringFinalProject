@@ -9,8 +9,7 @@ export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 
 DEFAULT_TESTS=(
-    "test/test_mixed_sddmm_metadata.py"
-    "test/test_mixed_sddmm_reference.py"
+    "test/test_mixed_sddmm.py"
 )
 
 GPU_TESTS=()
@@ -62,8 +61,27 @@ run_test_group() {
 }
 
 build_extension() {
-    echo "[run_test] python setup.py build_ext --inplace"
-    python setup.py build_ext --inplace
+    local build_log
+    build_log="$(mktemp)"
+
+    if [[ "${SHOW_BUILD_LOG:-0}" == "1" ]]; then
+        echo "[run_test] python setup.py build_ext --inplace"
+        python setup.py build_ext --inplace
+        rm -f "${build_log}"
+        return
+    fi
+
+    echo "[run_test] building extension (compiler warnings hidden; set SHOW_BUILD_LOG=1 to show full output)"
+    if python setup.py build_ext --inplace >"${build_log}" 2>&1; then
+        echo "[run_test] build_ext completed"
+    else
+        echo "[run_test] build_ext failed; replaying full build log" >&2
+        cat "${build_log}" >&2
+        rm -f "${build_log}"
+        return 1
+    fi
+
+    rm -f "${build_log}"
 }
 
 discover_tests

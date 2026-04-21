@@ -29,7 +29,7 @@ The first design change is to split this into two independent knobs, for example
 | --- | --- | --- | --- |
 | 1 | [Done] Freeze the new semantics and tensor layout. Define independent `dense_width` and `sparse_width`, decide whether dense and sparse expert indices stay concatenated or are carried as separate tensors, and define the output layout for dense `ir` and sparse `mask_v`. | A small design section in code comments plus a shared metadata builder API, likely in a new Triton-side helper module. | Shape assertions for `mask_c_dense`, `mask_c_sparse`, `mask_r_sparse`, `ir_dense`, and `mask_v_sparse`; verify `sparse_width = 0` is legal. |
 | 2 | [Done] Build a pure PyTorch reference oracle for the new behavior. This reference should compute `ref = (x @ up.T) * silu(x @ gate.T)` first, then slice dense columns and sparse sampled rows exactly according to the new metadata. | A reference implementation in a new test/helper file, likely under `moe_src/test/`. | Compare dense slices and sparse sampled slices against the full dense reference for multiple `(bs, dense_width, sparse_width, maxnnz)` combinations. |
-| 3 | Implement a Triton mixed SDDMM prototype. One launch grid covers both dense and sparse regions. Each block derives its region from `program_id`, then dispatches to either the dense path or sparse path. | A new Triton kernel module, likely `moe_src/triton/mixed_sddmm.py`. | For small shapes, compare Triton outputs against the PyTorch oracle with max-abs-diff and mismatch-count checks. Include cases `sparse_width > dense_width`, `sparse_width < dense_width`, and `sparse_width = 0`. |
+| 3 | [Done] Implement a Triton mixed SDDMM prototype. One launch grid covers both dense and sparse regions. Each block derives its region from `program_id`, then dispatches to either the dense path or sparse path. | A new Triton kernel module, likely `moe_src/triton/mixed_sddmm.py`. | For small shapes, compare Triton outputs against the PyTorch oracle with max-abs-diff and mismatch-count checks. Include cases `sparse_width > dense_width`, `sparse_width < dense_width`, and `sparse_width = 0`. |
 | 4 | Implement dense-region block mapping and tensor-core compute. Dense blocks should read contiguous `x` and weight tiles and use Triton `dot` patterns that lower to tensor cores on fp16/bf16-capable GPUs. | Dense path in the Triton kernel plus launch-time block-count calculation. | Inspect output correctness first, then benchmark dense-only cases against the current dense baseline. The acceptance target is that the `sparse_width = 0` mode is not slower than the baseline by an unacceptable margin. |
 | 5 | Implement sparse-region block mapping and exact sparse memory access. Sparse blocks should load only the selected token rows from `mask_r_sparse` and only the selected expert blocks from `mask_c_sparse`, without materializing full dense intermediate tiles. | Sparse path in the Triton kernel plus sparse metadata preparation helpers. | Validate that sparse outputs match the oracle exactly on sampled rows. Confirm no extra dense-sized temporary tensor is allocated for the sparse path. |
 | 6 | Build the unified scheduler metadata. Host-side code should compute the number of dense blocks and sparse blocks, pass compact metadata to the Triton kernel, and let blocks self-dispatch. | Metadata builder and launcher wrapper, likely in the same Triton module or a nearby wrapper file. | For small debug cases, print or assert the block-to-region mapping and verify there are no overlapping writes or uncovered tiles. |
@@ -75,22 +75,54 @@ Step 2 is complete in the current branch.
   - CPU
   - CUDA, when available
 
+## Step 3 Completion Notes
+
+Step 3 is complete in the current branch.
+
+- Added a Triton mixed SDDMM validation kernel in:
+  - `moe_src/triton_kernels/mixed_sddmm.py`
+- The launcher uses one program-id space for both regions:
+  - dense programs occupy the first contiguous range
+  - sparse programs occupy the following contiguous range
+  - each Triton program self-dispatches to the dense or sparse path from `program_id`
+- The Triton path writes directly into the frozen Step 1 output layout:
+  - `ir_dense[batch, dense_width, expert_block_size]`
+  - `mask_v_sparse[maxnnz, sparse_width, expert_block_size]`
+- The implementation keeps Step 3 scoped to SDDMM validation only and does not modify the existing CUDA `spmm` integration path.
+- The local Triton validation package was placed under `moe_src/triton_kernels/` instead of `moe_src/triton/`.
+  - This avoids shadowing the upstream Python `triton` package when `moe_src/` is added to `PYTHONPATH`.
+- The Step 1 and Step 2 unit tests were merged into one file and extended with Step 3 validation:
+  - `moe_src/test/test_mixed_sddmm.py`
+- The Step 3 Triton unit test validates:
+  - `sparse_width < dense_width`
+  - `sparse_width > dense_width`
+  - `sparse_width = 0`
+- The Step 3 unit test currently uses scaled fp16 inputs for stable comparison against the PyTorch oracle under the prototype kernel.
+
 ## Test Runner Notes
 
-- `moe_src/run_test.sh` now treats the Step 1 and Step 2 pure-PyTorch tests as the default test set.
-- Those default tests execute on CPU first and also cover CUDA automatically when CUDA is available.
+- `moe_src/run_test.sh` now treats `moe_src/test/test_mixed_sddmm.py` as the default mixed SDDMM validation test.
+- That unified test file covers:
+  - Step 1 metadata validation
+  - Step 2 PyTorch oracle validation
+  - Step 3 Triton-vs-oracle validation
+- The default unit tests execute on CPU first and also cover CUDA automatically when CUDA is available.
 - GPU-backed extension tests remain separate and are only run when CUDA is available.
 - `moe_src/test/test_oss.py` is intentionally kept as a legacy reference script, but it is not part of the default regression path and is skipped by `moe_src/run_test.sh`.
+- `moe_src/run_test.sh` now hides successful extension build warnings by default.
+  - Set `SHOW_BUILD_LOG=1` to print the full compiler output.
+  - On build failure, the full build log is replayed automatically.
 
 ## Current Validation Status
 
-- `python moe_src/test/test_mixed_sddmm_metadata.py` passes.
-- `python -m unittest moe_src.test.test_mixed_sddmm_metadata moe_src.test.test_mixed_sddmm_reference` passes.
-  - when CUDA is available, this exercises both the CPU and CUDA paths for Step 1 and Step 2
+- `python -m unittest moe_src.test.test_mixed_sddmm` passes.
+  - this covers Step 1, Step 2, and Step 3 in one unit test file
+  - when CUDA is available, this exercises the CPU path, the CUDA path, and the Triton validation path
 - `CUDA_VISIBLE_DEVICES=-1 bash moe_src/run_test.sh` passes.
-  - this confirms the default pure-PyTorch tests run correctly in CPU-only mode
+  - this confirms the unified mixed SDDMM test file runs correctly in CPU-only mode
   - this also confirms `test/test_oss.py` is reported as a skipped legacy non-default test
-- `bash moe_src/run.sh` now defaults to `CUDA_VISIBLE_DEVICES=6`, rebuilds the extension, and runs the active test set.
+- `bash moe_src/run.sh` passes.
+  - this rebuilds the extension, runs the unified mixed SDDMM test file, and then runs `moe_src/test/test.py`
 - `moe_src/test/test.py` was updated to:
   - remove the stale `transformers` dependency
   - replace hardcoded `448` widths with `expert_w`
@@ -99,9 +131,9 @@ Step 2 is complete in the current branch.
 
 ## Suggested File Outputs
 
-- `moe_src/triton/mixed_sddmm.py`
-- `moe_src/triton/__init__.py`
-- `moe_src/test/test_triton_sddmm.py`
+- `moe_src/triton_kernels/mixed_sddmm.py`
+- `moe_src/triton_kernels/__init__.py`
+- `moe_src/test/test_mixed_sddmm.py`
 - optional shared metadata helper if the launcher logic becomes non-trivial
 
 ## Validation Matrix
