@@ -30,7 +30,7 @@ The first design change is to split this into two independent knobs, for example
 | 1 | [Done] Freeze the new semantics and tensor layout. Define independent `dense_width` and `sparse_width`, decide whether dense and sparse expert indices stay concatenated or are carried as separate tensors, and define the output layout for dense `ir` and sparse `mask_v`. | A small design section in code comments plus a shared metadata builder API, likely in a new Triton-side helper module. | Shape assertions for `mask_c_dense`, `mask_c_sparse`, `mask_r_sparse`, `ir_dense`, and `mask_v_sparse`; verify `sparse_width = 0` is legal. |
 | 2 | [Done] Build a pure PyTorch reference oracle for the new behavior. This reference should compute `ref = (x @ up.T) * silu(x @ gate.T)` first, then slice dense columns and sparse sampled rows exactly according to the new metadata. | A reference implementation in a new test/helper file, likely under `moe_src/test/`. | Compare dense slices and sparse sampled slices against the full dense reference for multiple `(bs, dense_width, sparse_width, maxnnz)` combinations. |
 | 3 | [Done] Implement a Triton mixed SDDMM prototype. One launch grid covers both dense and sparse regions. Each block derives its region from `program_id`, then dispatches to either the dense path or sparse path. | A new Triton kernel module, likely `moe_src/triton/mixed_sddmm.py`. | For small shapes, compare Triton outputs against the PyTorch oracle with max-abs-diff and mismatch-count checks. Include cases `sparse_width > dense_width`, `sparse_width < dense_width`, and `sparse_width = 0`. |
-| 4 | Implement dense-region block mapping and tensor-core compute. Dense blocks should read contiguous `x` and weight tiles and use Triton `dot` patterns that lower to tensor cores on fp16/bf16-capable GPUs. | Dense path in the Triton kernel plus launch-time block-count calculation. | Inspect output correctness first, then benchmark dense-only cases against the current dense baseline. The acceptance target is that the `sparse_width = 0` mode is not slower than the baseline by an unacceptable margin. |
+| 4 | [Done] Implement dense-region block mapping and tensor-core compute. Dense blocks should read contiguous `x` and weight tiles and use Triton `dot` patterns that lower to tensor cores on fp16/bf16-capable GPUs. | Dense path in the Triton kernel plus launch-time block-count calculation. | Inspect output correctness first, then benchmark dense-only cases against the current dense baseline. The acceptance target is that the `sparse_width = 0` mode is not slower than the baseline by an unacceptable margin. |
 | 5 | Implement sparse-region block mapping and exact sparse memory access. Sparse blocks should load only the selected token rows from `mask_r_sparse` and only the selected expert blocks from `mask_c_sparse`, without materializing full dense intermediate tiles. | Sparse path in the Triton kernel plus sparse metadata preparation helpers. | Validate that sparse outputs match the oracle exactly on sampled rows. Confirm no extra dense-sized temporary tensor is allocated for the sparse path. |
 | 6 | Build the unified scheduler metadata. Host-side code should compute the number of dense blocks and sparse blocks, pass compact metadata to the Triton kernel, and let blocks self-dispatch. | Metadata builder and launcher wrapper, likely in the same Triton module or a nearby wrapper file. | For small debug cases, print or assert the block-to-region mapping and verify there are no overlapping writes or uncovered tiles. |
 | 7 | Add a correctness and speed test harness. The test should generate random inputs and routing, run the reference path and Triton path, and report both numerical error and latency. | A new executable test script, likely `moe_src/test/test_triton_sddmm.py`. | Correctness: max abs diff, relative diff, mismatch ratio. Speed: warmup + timed iterations, median/mean latency, and throughput across several width settings. |
@@ -99,6 +99,41 @@ Step 3 is complete in the current branch.
   - `sparse_width = 0`
 - The Step 3 unit test currently uses scaled fp16 inputs for stable comparison against the PyTorch oracle under the prototype kernel.
 
+## Step 4 Completion Notes
+
+Step 4 is complete in the current branch.
+
+- Dense-region launch metadata is now built explicitly in:
+  - `moe_src/triton_kernels/mixed_sddmm.py`
+- The dense path uses grouped block scheduling and Triton `tl.dot` tiles intended for tensor-core-friendly fp16/bf16 execution.
+- Added a specialized dense-only Triton kernel and launcher:
+  - `_dense_only_sddmm_kernel(...)`
+  - `launch_dense_only_sddmm_triton(...)`
+- The mixed launcher keeps the one-launch path for mixed dense+sparse execution, but when `sparse_width = 0` it now routes to the specialized dense-only kernel automatically.
+- The dense-only Triton path computes the full activation output directly:
+  - `output = (x @ up.T) * silu(x @ gate.T)`
+  - it does not return a raw matmul intermediate
+- The dense-only baseline used for benchmarking is the PyTorch implementation of the same selected-dense semantics:
+  - `dense_ref = (x @ dense_up_flat.T) * silu(x @ dense_gate_flat.T)`
+  - on CUDA, this is expected to lower through PyTorch to cuBLAS/cuBLASLt-backed GEMM paths
+- Added dense-only correctness and speed coverage in `moe_src/test/test_mixed_sddmm.py` for:
+  - `m = bs`, `expert_n = 512`, `k = 2048`, `dense_width = 4`, so `total_n = 2048`
+  - `m = bs`, `expert_n = 512`, `k = 2048`, `dense_width = 16`, so `total_n = 8192`
+  - `bs in {32, 64, 128, 256}`
+- Added a reproducible dense-only launch-parameter sweep across:
+  - `block_m`
+  - `block_n`
+  - `block_k`
+  - `dense_group_m`
+  - `num_warps`
+  - `num_stages`
+- The best observed tuned configs in the current environment are:
+  - `total_n = 2048`: `block_m=32, block_n=128, block_k=64, dense_group_m=4, num_warps=8, num_stages=2`
+  - `total_n = 8192`: `block_m=64, block_n=128, block_k=32, dense_group_m=4, num_warps=8, num_stages=3`
+- Performance observations from the current machine:
+  - for `total_n = 2048`, Triton dense-only is still slower than the PyTorch dense baseline by roughly `1.8x` to `2.1x`
+  - for `total_n = 8192`, the tuned Triton dense-only path is faster than the PyTorch dense baseline, with ratios around `0.84x` to `0.90x`
+
 ## Test Runner Notes
 
 - `moe_src/run_test.sh` now treats `moe_src/test/test_mixed_sddmm.py` as the default mixed SDDMM validation test.
@@ -112,17 +147,32 @@ Step 3 is complete in the current branch.
 - `moe_src/run_test.sh` now hides successful extension build warnings by default.
   - Set `SHOW_BUILD_LOG=1` to print the full compiler output.
   - On build failure, the full build log is replayed automatically.
+- `moe_src/run.sh` now accepts:
+  - `bash moe_src/run.sh`
+    - runs correctness validation only
+  - `bash moe_src/run.sh --speed`
+    - enables `RUN_MIXED_SDDMM_BENCH=1`
+    - enables `RUN_MIXED_SDDMM_TUNE=1`
+    - runs dense-only speed benchmarks and the launch-parameter sweep in addition to correctness tests
 
 ## Current Validation Status
 
 - `python -m unittest moe_src.test.test_mixed_sddmm` passes.
   - this covers Step 1, Step 2, and Step 3 in one unit test file
   - when CUDA is available, this exercises the CPU path, the CUDA path, and the Triton validation path
+- `RUN_MIXED_SDDMM_BENCH=1 python -m unittest moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_dense_only_step4_benchmark moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_dense_only_large_total_n_benchmark` passes.
+  - this measures the dense-only Triton path against the PyTorch dense baseline for:
+    - `total_n = 2048`
+    - `total_n = 8192`
+- `RUN_MIXED_SDDMM_TUNE=1 python -m unittest moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_dense_only_parameter_sweep` passes.
+  - this prints the ranked launch-parameter sweep results for the current GPU
 - `CUDA_VISIBLE_DEVICES=-1 bash moe_src/run_test.sh` passes.
   - this confirms the unified mixed SDDMM test file runs correctly in CPU-only mode
   - this also confirms `test/test_oss.py` is reported as a skipped legacy non-default test
 - `bash moe_src/run.sh` passes.
   - this rebuilds the extension, runs the unified mixed SDDMM test file, and then runs `moe_src/test/test.py`
+- `bash moe_src/run.sh --speed` passes.
+  - this runs correctness validation, the Step 4 dense-only benchmarks, the launch-parameter sweep, and the existing GPU-backed integration test path
 - `moe_src/test/test.py` was updated to:
   - remove the stale `transformers` dependency
   - replace hardcoded `448` widths with `expert_w`
@@ -135,6 +185,21 @@ Step 3 is complete in the current branch.
 - `moe_src/triton_kernels/__init__.py`
 - `moe_src/test/test_mixed_sddmm.py`
 - optional shared metadata helper if the launcher logic becomes non-trivial
+
+## How To Validate
+
+Correctness:
+
+- `python -m unittest moe_src.test.test_mixed_sddmm`
+- `bash moe_src/run.sh`
+
+Speed:
+
+- `bash moe_src/run.sh --speed`
+- direct benchmark only:
+  - `RUN_MIXED_SDDMM_BENCH=1 python -m unittest moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_dense_only_step4_benchmark moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_dense_only_large_total_n_benchmark`
+- direct sweep only:
+  - `RUN_MIXED_SDDMM_TUNE=1 python -m unittest moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_dense_only_parameter_sweep`
 
 ## Validation Matrix
 

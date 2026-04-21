@@ -85,6 +85,12 @@ build_extension() {
 }
 
 discover_tests
+if [[ "${RUN_MIXED_SDDMM_BENCH:-0}" == "1" ]]; then
+    echo "[run_test] Dense-only speed benchmarks enabled"
+fi
+if [[ "${RUN_MIXED_SDDMM_TUNE:-0}" == "1" ]]; then
+    echo "[run_test] Dense-only parameter sweep enabled"
+fi
 run_test_group "DEFAULT" "${DEFAULT_TESTS[@]}"
 printf '[run_test] Skipping legacy non-default test: %s\n' "${LEGACY_OPTIONAL_TESTS[@]}"
 
