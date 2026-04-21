@@ -11,7 +11,15 @@ results/
 # python build
 __pycache__/
 build/
+dist/
 *.egg-info/
+*.egg
+*.so
+*.o
+*.a
+*.dll
+*.dylib
+*.pyd
 
 # data
 data/
