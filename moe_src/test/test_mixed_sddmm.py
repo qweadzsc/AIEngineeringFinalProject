@@ -15,15 +15,21 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from moe_src.sddmm_validation import (
+    MixedSDDMMMetadata,
     build_full_sddmm_reference,
     build_mixed_sddmm_metadata,
     build_mixed_sddmm_reference,
     slice_mixed_sddmm_reference,
+    split_mixed_sddmm_metadata,
 )
 from moe_src.triton_kernels import (
+    MixedSDDMMProgramAssignment,
+    build_mixed_sddmm_program_map,
     build_mixed_sddmm_launch_metadata,
     launch_dense_only_sddmm_triton,
+    launch_mixed_only_sddmm_triton,
     launch_mixed_sddmm_triton,
+    launch_sparse_only_sddmm_triton,
 )
 
 
@@ -66,6 +72,12 @@ TUNED_LARGE_TOTAL_N_CONFIG = {
     "num_warps": 8,
     "num_stages": 3,
 }
+
+MIXED_SPEED_SPLIT_CASES = [
+    {"dense_width": 12, "sparse_width": 4},
+    {"dense_width": 8, "sparse_width": 8},
+    {"dense_width": 4, "sparse_width": 12},
+]
 
 
 class _DeviceMixin:
@@ -162,6 +174,50 @@ class MixedSDDMMMetadataTest(_DeviceMixin, unittest.TestCase):
                 self.assertEqual(mask_v_sparse.device.type, device.type)
                 self.assertEqual(tuple(ir_dense.shape), (3, 2, 128))
                 self.assertEqual(tuple(mask_v_sparse.shape), (2, 0, 128))
+
+    def test_dense_width_zero_is_legal(self) -> None:
+        routing_weights_cpu = torch.tensor(
+            [
+                [0.6, 1.0, 0.0, 0.0, 0.0, 0.0],
+                [0.5, 0.9, 0.2, 0.0, 0.0, 0.0],
+                [0.4, 0.8, 0.3, 0.7, 0.0, 0.0],
+                [0.3, 0.7, 0.4, 0.6, 0.2, 0.0],
+                [0.2, 0.6, 0.5, 0.5, 0.1, 0.0],
+                [0.0, 0.5, 0.0, 0.0, 0.0, 0.3],
+            ],
+            dtype=torch.float32,
+        )
+        expected_mask_c_sparse = torch.tensor([1, 0], dtype=torch.long)
+        expected_mask_r_sparse = torch.tensor(
+            [
+                [0, 0],
+                [1, 1],
+            ],
+            dtype=torch.long,
+        )
+
+        for device in self._devices():
+            with self.subTest(device=device.type):
+                routing_weights = routing_weights_cpu.to(device=device)
+                metadata = build_mixed_sddmm_metadata(
+                    routing_weights,
+                    dense_width=0,
+                    sparse_width=2,
+                    maxnnz=2,
+                    expert_block_size=128,
+                )
+
+                self.assertEqual(tuple(metadata.mask_c_dense.shape), (0,))
+                self.assertTrue(torch.equal(metadata.mask_c_sparse, expected_mask_c_sparse.to(device=device)))
+                self.assertTrue(torch.equal(metadata.mask_r_sparse, expected_mask_r_sparse.to(device=device)))
+                self.assertEqual(metadata.ir_dense_shape, (6, 0, 128))
+                self.assertEqual(metadata.mask_v_sparse_shape, (2, 2, 128))
+
+                ir_dense, mask_v_sparse = metadata.allocate_output_buffers(dtype=torch.float16)
+                self.assertEqual(ir_dense.numel(), 0)
+                self.assertEqual(mask_v_sparse.device.type, device.type)
+                self.assertEqual(tuple(ir_dense.shape), (6, 0, 128))
+                self.assertEqual(tuple(mask_v_sparse.shape), (2, 2, 128))
 
 
 class MixedSDDMMReferenceTest(_DeviceMixin, unittest.TestCase):
@@ -392,6 +448,82 @@ class MixedSDDMMTritonTest(unittest.TestCase):
             lambda: launch_dense_only_sddmm_triton(x, up_proj, gate_proj, metadata, **launch_kwargs).ir_dense
         )
 
+    def _build_full_dense_bmm_baseline(
+        self,
+        x: torch.Tensor,
+        up_proj: torch.Tensor,
+        gate_proj: torch.Tensor,
+        *,
+        expert_block_size: int,
+    ) -> torch.Tensor:
+        batch_size, hidden_dim = tuple(x.shape)
+        total_rows = up_proj.shape[0]
+        if total_rows % expert_block_size != 0:
+            raise AssertionError(f"up_proj rows={total_rows} must be divisible by expert_block_size={expert_block_size}")
+        num_experts = total_rows // expert_block_size
+
+        x_batched = x.unsqueeze(0).repeat(num_experts, 1, 1)
+        up_batched = up_proj.view(num_experts, expert_block_size, hidden_dim).transpose(1, 2).contiguous()
+        gate_batched = gate_proj.view(num_experts, expert_block_size, hidden_dim).transpose(1, 2).contiguous()
+
+        up_out = torch.bmm(x_batched, up_batched)
+        gate_out = torch.bmm(x_batched, gate_batched)
+        full_out = up_out * F.silu(gate_out)
+        return full_out.permute(1, 0, 2).contiguous().view(batch_size, total_rows)
+
+    def _build_manual_metadata(
+        self,
+        *,
+        batch_size: int,
+        num_experts: int,
+        expert_block_size: int,
+        dense_width: int,
+        sparse_width: int,
+        maxnnz: int,
+        device: torch.device,
+    ) -> MixedSDDMMMetadata:
+        mask_c_dense = torch.arange(dense_width, dtype=torch.long, device=device)
+        mask_c_sparse = torch.arange(
+            dense_width,
+            dense_width + sparse_width,
+            dtype=torch.long,
+            device=device,
+        )
+        if sparse_width == 0 or maxnnz == 0:
+            mask_r_sparse = torch.empty((maxnnz, sparse_width), dtype=torch.long, device=device)
+        else:
+            row_slots = torch.arange(maxnnz, dtype=torch.long, device=device).unsqueeze(1)
+            sparse_offsets = torch.arange(sparse_width, dtype=torch.long, device=device).unsqueeze(0)
+            mask_r_sparse = (row_slots + sparse_offsets) % batch_size
+
+        metadata = MixedSDDMMMetadata(
+            batch_size=batch_size,
+            num_experts=num_experts,
+            expert_block_size=expert_block_size,
+            dense_width=dense_width,
+            sparse_width=sparse_width,
+            maxnnz=maxnnz,
+            mask_c_dense=mask_c_dense,
+            mask_c_sparse=mask_c_sparse,
+            mask_r_sparse=mask_r_sparse,
+        )
+        metadata.assert_valid()
+        return metadata
+
+    def _mixed_work_ratio(
+        self,
+        *,
+        batch_size: int,
+        num_experts: int,
+        dense_width: int,
+        sparse_width: int,
+        maxnnz: int,
+    ) -> float:
+        dense_work = batch_size * dense_width
+        sparse_work = maxnnz * sparse_width
+        full_dense_work = batch_size * num_experts
+        return (dense_work + sparse_work) / full_dense_work
+
     def _verify_dense_only_config(
         self,
         x: torch.Tensor,
@@ -406,6 +538,21 @@ class MixedSDDMMTritonTest(unittest.TestCase):
         result = launch_dense_only_sddmm_triton(x, up_proj, gate_proj, metadata, **launch_kwargs)
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(result.ir_dense, expected_dense, atol=5e-2, rtol=5e-2))
+
+    def _verify_sparse_only_config(
+        self,
+        x: torch.Tensor,
+        up_proj: torch.Tensor,
+        gate_proj: torch.Tensor,
+        metadata,
+        expected_sparse: torch.Tensor,
+        *,
+        launch_kwargs: dict | None = None,
+    ) -> None:
+        launch_kwargs = launch_kwargs or {}
+        result = launch_sparse_only_sddmm_triton(x, up_proj, gate_proj, metadata, **launch_kwargs)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(result.mask_v_sparse, expected_sparse, atol=5e-2, rtol=5e-2))
 
     def _run_case(
         self,
@@ -472,6 +619,300 @@ class MixedSDDMMTritonTest(unittest.TestCase):
         for case in cases:
             with self.subTest(**case):
                 self._run_case(**case)
+
+    def test_mixed_metadata_splits_into_dense_and_sparse_views(self) -> None:
+        x, up_proj, gate_proj, routing_weights = self._build_case_tensors(
+            batch_size=13,
+            num_experts=9,
+            hidden_dim=80,
+            expert_block_size=96,
+            seed=38013,
+            scale=0.05,
+        )
+        del x, up_proj, gate_proj
+        metadata = build_mixed_sddmm_metadata(
+            routing_weights,
+            dense_width=3,
+            sparse_width=4,
+            maxnnz=5,
+            expert_block_size=96,
+        )
+        dense_only_metadata, sparse_only_metadata = split_mixed_sddmm_metadata(metadata)
+
+        self.assertEqual(dense_only_metadata.dense_width, metadata.dense_width)
+        self.assertEqual(dense_only_metadata.sparse_width, 0)
+        self.assertEqual(dense_only_metadata.maxnnz, 0)
+        self.assertTrue(torch.equal(dense_only_metadata.mask_c_dense, metadata.mask_c_dense))
+        self.assertEqual(tuple(dense_only_metadata.mask_c_sparse.shape), (0,))
+        self.assertEqual(tuple(dense_only_metadata.mask_r_sparse.shape), (0, 0))
+
+        self.assertEqual(sparse_only_metadata.dense_width, 0)
+        self.assertEqual(sparse_only_metadata.sparse_width, metadata.sparse_width)
+        self.assertEqual(sparse_only_metadata.maxnnz, metadata.maxnnz)
+        self.assertEqual(tuple(sparse_only_metadata.mask_c_dense.shape), (0,))
+        self.assertTrue(torch.equal(sparse_only_metadata.mask_c_sparse, metadata.mask_c_sparse))
+        self.assertTrue(torch.equal(sparse_only_metadata.mask_r_sparse, metadata.mask_r_sparse))
+
+    def test_mixed_program_map_covers_dense_then_sparse_ranges(self) -> None:
+        x, up_proj, gate_proj, routing_weights = self._build_case_tensors(
+            batch_size=17,
+            num_experts=9,
+            hidden_dim=96,
+            expert_block_size=80,
+            seed=39017,
+            scale=0.05,
+        )
+        del x, up_proj, gate_proj
+        metadata = build_mixed_sddmm_metadata(
+            routing_weights,
+            dense_width=3,
+            sparse_width=4,
+            maxnnz=6,
+            expert_block_size=80,
+        )
+        launch_metadata = build_mixed_sddmm_launch_metadata(
+            metadata,
+            block_m=32,
+            block_n=64,
+            block_k=32,
+            dense_group_m=4,
+            num_warps=4,
+            num_stages=2,
+        )
+        program_map = build_mixed_sddmm_program_map(metadata, launch_metadata)
+
+        self.assertEqual(len(program_map), launch_metadata.total_programs)
+        self.assertEqual([entry.pid for entry in program_map], list(range(launch_metadata.total_programs)))
+
+        dense_entries = [entry for entry in program_map if entry.region == "dense"]
+        sparse_entries = [entry for entry in program_map if entry.region == "sparse"]
+        self.assertEqual(len(dense_entries), launch_metadata.dense_programs)
+        self.assertEqual(len(sparse_entries), launch_metadata.sparse_programs)
+        self.assertEqual([entry.pid for entry in dense_entries], list(launch_metadata.dense_program_range))
+        self.assertEqual([entry.pid for entry in sparse_entries], list(launch_metadata.sparse_program_range))
+
+        dense_slot_counts = [0 for _ in range(metadata.dense_width)]
+        for entry in dense_entries:
+            self.assertIsInstance(entry, MixedSDDMMProgramAssignment)
+            self.assertLess(entry.slot, metadata.dense_width)
+            self.assertLess(entry.tile_m, launch_metadata.dense_tiles_m)
+            self.assertLess(entry.tile_n, launch_metadata.tiles_n)
+            dense_slot_counts[entry.slot] += 1
+        self.assertEqual(
+            dense_slot_counts,
+            [launch_metadata.dense_tiles_m * launch_metadata.tiles_n for _ in range(metadata.dense_width)],
+        )
+
+        sparse_slot_counts = [0 for _ in range(metadata.sparse_width)]
+        for entry in sparse_entries:
+            self.assertLess(entry.slot, metadata.sparse_width)
+            self.assertLess(entry.tile_m, launch_metadata.sparse_tiles_m)
+            self.assertLess(entry.tile_n, launch_metadata.tiles_n)
+            sparse_slot_counts[entry.slot] += 1
+        self.assertEqual(
+            sparse_slot_counts,
+            [launch_metadata.sparse_tiles_m * launch_metadata.tiles_n for _ in range(metadata.sparse_width)],
+        )
+
+    def test_mixed_kernel_matches_reference_on_ragged_shapes(self) -> None:
+        cases = [
+            {
+                "batch_size": 13,
+                "num_experts": 9,
+                "hidden_dim": 80,
+                "expert_block_size": 96,
+                "dense_width": 3,
+                "sparse_width": 4,
+                "maxnnz": 5,
+                "seed": 41013,
+            },
+            {
+                "batch_size": 21,
+                "num_experts": 10,
+                "hidden_dim": 112,
+                "expert_block_size": 80,
+                "dense_width": 2,
+                "sparse_width": 5,
+                "maxnnz": 7,
+                "seed": 42021,
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(**case):
+                x, up_proj, gate_proj, routing_weights = self._build_case_tensors(
+                    batch_size=case["batch_size"],
+                    num_experts=case["num_experts"],
+                    hidden_dim=case["hidden_dim"],
+                    expert_block_size=case["expert_block_size"],
+                    seed=case["seed"],
+                    scale=0.05,
+                )
+                metadata = build_mixed_sddmm_metadata(
+                    routing_weights,
+                    dense_width=case["dense_width"],
+                    sparse_width=case["sparse_width"],
+                    maxnnz=case["maxnnz"],
+                    expert_block_size=case["expert_block_size"],
+                )
+                reference = build_mixed_sddmm_reference(x, up_proj, gate_proj, metadata)
+                result = launch_mixed_sddmm_triton(
+                    x,
+                    up_proj,
+                    gate_proj,
+                    metadata,
+                    use_dense_only_fast_path=False,
+                    use_sparse_only_fast_path=False,
+                )
+                torch.cuda.synchronize()
+
+                self.assertEqual(result.kernel_variant, "mixed")
+                self.assertGreater(result.dense_programs, 0)
+                self.assertGreater(result.sparse_programs, 0)
+                self.assertTrue(torch.allclose(result.ir_dense, reference.ir_dense, atol=5e-2, rtol=5e-2))
+                self.assertTrue(torch.allclose(result.mask_v_sparse, reference.mask_v_sparse, atol=5e-2, rtol=5e-2))
+
+    def test_mixed_kernel_matches_dense_and_sparse_specialized_subpaths(self) -> None:
+        cases = [
+            {
+                "batch_size": 17,
+                "num_experts": 9,
+                "hidden_dim": 96,
+                "expert_block_size": 80,
+                "dense_width": 3,
+                "sparse_width": 4,
+                "maxnnz": 6,
+                "seed": 45017,
+            },
+            {
+                "batch_size": 23,
+                "num_experts": 12,
+                "hidden_dim": 128,
+                "expert_block_size": 112,
+                "dense_width": 4,
+                "sparse_width": 3,
+                "maxnnz": 9,
+                "seed": 46023,
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(**case):
+                x, up_proj, gate_proj, routing_weights = self._build_case_tensors(
+                    batch_size=case["batch_size"],
+                    num_experts=case["num_experts"],
+                    hidden_dim=case["hidden_dim"],
+                    expert_block_size=case["expert_block_size"],
+                    seed=case["seed"],
+                    scale=0.05,
+                )
+                metadata = build_mixed_sddmm_metadata(
+                    routing_weights,
+                    dense_width=case["dense_width"],
+                    sparse_width=case["sparse_width"],
+                    maxnnz=case["maxnnz"],
+                    expert_block_size=case["expert_block_size"],
+                )
+                dense_only_metadata, sparse_only_metadata = split_mixed_sddmm_metadata(metadata)
+                reference = build_mixed_sddmm_reference(x, up_proj, gate_proj, metadata)
+
+                mixed_result = launch_mixed_sddmm_triton(
+                    x,
+                    up_proj,
+                    gate_proj,
+                    metadata,
+                    use_dense_only_fast_path=False,
+                    use_sparse_only_fast_path=False,
+                )
+                dense_result = launch_dense_only_sddmm_triton(x, up_proj, gate_proj, dense_only_metadata)
+                sparse_result = launch_sparse_only_sddmm_triton(x, up_proj, gate_proj, sparse_only_metadata)
+                torch.cuda.synchronize()
+
+                self.assertEqual(mixed_result.kernel_variant, "mixed")
+                self.assertEqual(dense_result.kernel_variant, "dense_only")
+                self.assertEqual(sparse_result.kernel_variant, "sparse_only")
+                self.assertTrue(torch.allclose(mixed_result.ir_dense, reference.ir_dense, atol=5e-2, rtol=5e-2))
+                self.assertTrue(
+                    torch.allclose(mixed_result.mask_v_sparse, reference.mask_v_sparse, atol=5e-2, rtol=5e-2)
+                )
+                self.assertTrue(torch.allclose(mixed_result.ir_dense, dense_result.ir_dense, atol=5e-2, rtol=5e-2))
+                self.assertTrue(
+                    torch.allclose(mixed_result.mask_v_sparse, sparse_result.mask_v_sparse, atol=5e-2, rtol=5e-2)
+                )
+                self.assertEqual(mixed_result.dense_programs, dense_result.dense_programs)
+                self.assertEqual(mixed_result.sparse_programs, sparse_result.sparse_programs)
+
+    def test_mixed_only_launcher_matches_wrapper_and_reference(self) -> None:
+        cases = [
+            {
+                "batch_size": 19,
+                "num_experts": 11,
+                "hidden_dim": 96,
+                "expert_block_size": 80,
+                "dense_width": 3,
+                "sparse_width": 5,
+                "maxnnz": 6,
+                "seed": 47019,
+            },
+            {
+                "batch_size": 29,
+                "num_experts": 12,
+                "hidden_dim": 144,
+                "expert_block_size": 112,
+                "dense_width": 4,
+                "sparse_width": 4,
+                "maxnnz": 9,
+                "seed": 48029,
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(**case):
+                x, up_proj, gate_proj, routing_weights = self._build_case_tensors(
+                    batch_size=case["batch_size"],
+                    num_experts=case["num_experts"],
+                    hidden_dim=case["hidden_dim"],
+                    expert_block_size=case["expert_block_size"],
+                    seed=case["seed"],
+                    scale=0.05,
+                )
+                metadata = build_mixed_sddmm_metadata(
+                    routing_weights,
+                    dense_width=case["dense_width"],
+                    sparse_width=case["sparse_width"],
+                    maxnnz=case["maxnnz"],
+                    expert_block_size=case["expert_block_size"],
+                )
+                reference = build_mixed_sddmm_reference(x, up_proj, gate_proj, metadata)
+                wrapper_result = launch_mixed_sddmm_triton(
+                    x,
+                    up_proj,
+                    gate_proj,
+                    metadata,
+                    use_dense_only_fast_path=False,
+                    use_sparse_only_fast_path=False,
+                )
+                mixed_only_result = launch_mixed_only_sddmm_triton(x, up_proj, gate_proj, metadata)
+                torch.cuda.synchronize()
+
+                self.assertEqual(wrapper_result.kernel_variant, "mixed")
+                self.assertEqual(mixed_only_result.kernel_variant, "mixed")
+                self.assertEqual(wrapper_result.launch_metadata, mixed_only_result.launch_metadata)
+                self.assertTrue(torch.allclose(wrapper_result.ir_dense, reference.ir_dense, atol=5e-2, rtol=5e-2))
+                self.assertTrue(
+                    torch.allclose(wrapper_result.mask_v_sparse, reference.mask_v_sparse, atol=5e-2, rtol=5e-2)
+                )
+                self.assertTrue(
+                    torch.allclose(wrapper_result.ir_dense, mixed_only_result.ir_dense, atol=5e-2, rtol=5e-2)
+                )
+                self.assertTrue(
+                    torch.allclose(
+                        wrapper_result.mask_v_sparse,
+                        mixed_only_result.mask_v_sparse,
+                        atol=5e-2,
+                        rtol=5e-2,
+                    )
+                )
 
     def test_dense_only_triton_matches_selected_dense_baseline_across_step4_batch_sizes(self) -> None:
         num_experts = 8
@@ -571,6 +1012,97 @@ class MixedSDDMMTritonTest(unittest.TestCase):
                 self.assertTrue(torch.allclose(dense_only_result.ir_dense, expected_dense, atol=5e-2, rtol=5e-2))
                 self.assertTrue(torch.allclose(dense_only_result.ir_dense, mixed_result.ir_dense, atol=5e-2, rtol=5e-2))
                 self.assertEqual(dense_only_result.launch_metadata, mixed_result.launch_metadata)
+
+    def test_sparse_only_triton_matches_reference_across_step5_batch_sizes(self) -> None:
+        num_experts = 8
+        hidden_dim = 128
+        expert_block_size = 96
+        dense_width = 0
+        sparse_width = 4
+        maxnnz = 8
+
+        for batch_size in [16, 32, 64]:
+            with self.subTest(batch_size=batch_size):
+                x, up_proj, gate_proj, routing_weights = self._build_case_tensors(
+                    batch_size=batch_size,
+                    num_experts=num_experts,
+                    hidden_dim=hidden_dim,
+                    expert_block_size=expert_block_size,
+                    seed=30000 + batch_size,
+                    scale=0.05,
+                )
+                metadata = build_mixed_sddmm_metadata(
+                    routing_weights,
+                    dense_width=dense_width,
+                    sparse_width=sparse_width,
+                    maxnnz=maxnnz,
+                    expert_block_size=expert_block_size,
+                )
+                reference = build_mixed_sddmm_reference(x, up_proj, gate_proj, metadata)
+                result = launch_mixed_sddmm_triton(x, up_proj, gate_proj, metadata)
+                torch.cuda.synchronize()
+
+                sparse_mismatches, sparse_max_diff = self._diff_stats(
+                    result.mask_v_sparse,
+                    reference.mask_v_sparse,
+                    atol=5e-2,
+                )
+                self.assertEqual(result.kernel_variant, "sparse_only")
+                self.assertEqual(result.dense_programs, 0)
+                self.assertGreater(result.sparse_programs, 0)
+                self.assertEqual(result.ir_dense.numel(), 0)
+                self.assertEqual(result.ir_dense.untyped_storage().nbytes(), 0)
+                self.assertEqual(tuple(result.ir_dense.shape), metadata.ir_dense_shape)
+                self.assertEqual(tuple(result.mask_v_sparse.shape), metadata.mask_v_sparse_shape)
+                self.assertEqual(sparse_mismatches, 0, msg=f"sparse mismatches={sparse_mismatches}, max_diff={sparse_max_diff}")
+                self.assertLessEqual(sparse_max_diff, 5e-2)
+
+    def test_sparse_only_specialized_kernel_matches_mixed_kernel(self) -> None:
+        num_experts = 8
+        hidden_dim = 128
+        expert_block_size = 96
+        dense_width = 0
+        sparse_width = 4
+        maxnnz = 8
+
+        for batch_size in [16, 32, 64]:
+            with self.subTest(batch_size=batch_size):
+                x, up_proj, gate_proj, routing_weights = self._build_case_tensors(
+                    batch_size=batch_size,
+                    num_experts=num_experts,
+                    hidden_dim=hidden_dim,
+                    expert_block_size=expert_block_size,
+                    seed=34000 + batch_size,
+                    scale=0.05,
+                )
+                metadata = build_mixed_sddmm_metadata(
+                    routing_weights,
+                    dense_width=dense_width,
+                    sparse_width=sparse_width,
+                    maxnnz=maxnnz,
+                    expert_block_size=expert_block_size,
+                )
+                reference = build_mixed_sddmm_reference(x, up_proj, gate_proj, metadata)
+                mixed_result = launch_mixed_sddmm_triton(
+                    x,
+                    up_proj,
+                    gate_proj,
+                    metadata,
+                    use_sparse_only_fast_path=False,
+                )
+                sparse_only_result = launch_sparse_only_sddmm_triton(x, up_proj, gate_proj, metadata)
+                torch.cuda.synchronize()
+
+                self.assertEqual(mixed_result.kernel_variant, "mixed")
+                self.assertEqual(sparse_only_result.kernel_variant, "sparse_only")
+                self.assertTrue(torch.allclose(mixed_result.mask_v_sparse, reference.mask_v_sparse, atol=5e-2, rtol=5e-2))
+                self.assertTrue(
+                    torch.allclose(sparse_only_result.mask_v_sparse, reference.mask_v_sparse, atol=5e-2, rtol=5e-2)
+                )
+                self.assertTrue(
+                    torch.allclose(sparse_only_result.mask_v_sparse, mixed_result.mask_v_sparse, atol=5e-2, rtol=5e-2)
+                )
+                self.assertEqual(sparse_only_result.launch_metadata, mixed_result.launch_metadata)
 
     @unittest.skipUnless(
         torch.cuda.is_available() and os.getenv("RUN_MIXED_SDDMM_BENCH", "0") == "1",
@@ -820,6 +1352,119 @@ class MixedSDDMMTritonTest(unittest.TestCase):
                     f"  rank={rank} geom_ratio={geom_ratio:.3f} avg_ms={avg_ms:.3f} "
                     f"cfg={launch_kwargs} details={detail}"
                 )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and os.getenv("RUN_MIXED_SDDMM_BENCH", "0") == "1",
+        "Set RUN_MIXED_SDDMM_BENCH=1 to run the mixed-vs-dense torch bmm benchmark",
+    )
+    def test_mixed_vs_dense_torch_bmm_benchmark(self) -> None:
+        num_experts = 16
+        hidden_dim = 2048
+        expert_block_size = 512
+
+        print(
+            "[mixed-vs-dense-bmm] baseline=dense torch bmm over full n=16*512 "
+            "mixed=triton mixed kernel over dense rows plus sparse selected rows"
+        )
+
+        for batch_size in [32, 64, 128, 256]:
+            x, up_proj, gate_proj, _ = self._build_case_tensors(
+                batch_size=batch_size,
+                num_experts=num_experts,
+                hidden_dim=hidden_dim,
+                expert_block_size=expert_block_size,
+                seed=52000 + batch_size,
+                scale=0.05,
+            )
+            full_reference = build_full_sddmm_reference(
+                x,
+                up_proj,
+                gate_proj,
+                num_experts=num_experts,
+                expert_block_size=expert_block_size,
+            )
+            full_bmm_reference = self._build_full_dense_bmm_baseline(
+                x,
+                up_proj,
+                gate_proj,
+                expert_block_size=expert_block_size,
+            )
+            self.assertTrue(
+                torch.allclose(
+                    full_bmm_reference.view(batch_size, num_experts, expert_block_size),
+                    full_reference,
+                    atol=5e-2,
+                    rtol=5e-2,
+                )
+            )
+            baseline_ms = self._measure_cuda_ms(
+                lambda x=x, up_proj=up_proj, gate_proj=gate_proj, expert_block_size=expert_block_size: self._build_full_dense_bmm_baseline(
+                    x,
+                    up_proj,
+                    gate_proj,
+                    expert_block_size=expert_block_size,
+                ),
+                warmup=10,
+                iters=20,
+            )
+            self.assertGreater(baseline_ms, 0.0)
+
+            maxnnz_values = sorted({value for value in [4, 8, 16, 32, batch_size] if value <= batch_size})
+            for split_case in MIXED_SPEED_SPLIT_CASES:
+                dense_width = split_case["dense_width"]
+                sparse_width = split_case["sparse_width"]
+                for maxnnz in maxnnz_values:
+                    with self.subTest(
+                        batch_size=batch_size,
+                        dense_width=dense_width,
+                        sparse_width=sparse_width,
+                        maxnnz=maxnnz,
+                    ):
+                        metadata = self._build_manual_metadata(
+                            batch_size=batch_size,
+                            num_experts=num_experts,
+                            expert_block_size=expert_block_size,
+                            dense_width=dense_width,
+                            sparse_width=sparse_width,
+                            maxnnz=maxnnz,
+                            device=x.device,
+                        )
+                        expected_dense, expected_sparse = slice_mixed_sddmm_reference(full_reference, metadata)
+                        mixed_result = launch_mixed_only_sddmm_triton(x, up_proj, gate_proj, metadata)
+                        torch.cuda.synchronize()
+
+                        self.assertTrue(torch.allclose(mixed_result.ir_dense, expected_dense, atol=5e-2, rtol=5e-2))
+                        self.assertTrue(
+                            torch.allclose(mixed_result.mask_v_sparse, expected_sparse, atol=5e-2, rtol=5e-2)
+                        )
+
+                        mixed_ms = self._measure_cuda_ms(
+                            lambda x=x, up_proj=up_proj, gate_proj=gate_proj, metadata=metadata: launch_mixed_only_sddmm_triton(
+                                x,
+                                up_proj,
+                                gate_proj,
+                                metadata,
+                            ),
+                            warmup=10,
+                            iters=20,
+                        )
+                        latency_ratio = mixed_ms / baseline_ms
+                        work_ratio = self._mixed_work_ratio(
+                            batch_size=batch_size,
+                            num_experts=num_experts,
+                            dense_width=dense_width,
+                            sparse_width=sparse_width,
+                            maxnnz=maxnnz,
+                        )
+                        print(
+                            f"[mixed-vs-dense-bmm] m={batch_size} e={expert_block_size} "
+                            f"n={num_experts * expert_block_size} k={hidden_dim} "
+                            f"dense_width={dense_width} sparse_width={sparse_width} "
+                            f"maxnnz={maxnnz} work_ratio={work_ratio:.3f} "
+                            f"dense_torch_bmm_ms={baseline_ms:.3f} mixed_ms={mixed_ms:.3f} "
+                            f"latency_ratio={latency_ratio:.3f}"
+                        )
+                        self.assertGreater(mixed_ms, 0.0)
 
 
 if __name__ == "__main__":

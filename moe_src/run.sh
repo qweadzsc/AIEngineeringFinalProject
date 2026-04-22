@@ -16,7 +16,7 @@ while (($# > 0)); do
 Usage: bash moe_src/run.sh [--speed]
 
 Options:
-  --speed    Enable dense-only Triton speed benchmarks and parameter sweep.
+  --speed    Enable Triton speed benchmarks, mixed-vs-dense benchmark, and parameter sweep.
 EOF
             exit 0
             ;;

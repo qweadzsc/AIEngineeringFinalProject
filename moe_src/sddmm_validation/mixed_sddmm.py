@@ -168,3 +168,37 @@ def build_mixed_sddmm_metadata(
     )
     metadata.assert_valid()
     return metadata
+
+
+def split_mixed_sddmm_metadata(
+    metadata: MixedSDDMMMetadata,
+) -> tuple[MixedSDDMMMetadata, MixedSDDMMMetadata]:
+    metadata.assert_valid()
+    device = metadata.mask_c_dense.device
+
+    dense_only = MixedSDDMMMetadata(
+        batch_size=metadata.batch_size,
+        num_experts=metadata.num_experts,
+        expert_block_size=metadata.expert_block_size,
+        dense_width=metadata.dense_width,
+        sparse_width=0,
+        maxnnz=0,
+        mask_c_dense=metadata.mask_c_dense.clone(),
+        mask_c_sparse=torch.empty((0,), dtype=torch.long, device=device),
+        mask_r_sparse=torch.empty((0, 0), dtype=torch.long, device=device),
+    )
+    sparse_only = MixedSDDMMMetadata(
+        batch_size=metadata.batch_size,
+        num_experts=metadata.num_experts,
+        expert_block_size=metadata.expert_block_size,
+        dense_width=0,
+        sparse_width=metadata.sparse_width,
+        maxnnz=metadata.maxnnz,
+        mask_c_dense=torch.empty((0,), dtype=torch.long, device=device),
+        mask_c_sparse=metadata.mask_c_sparse.clone(),
+        mask_r_sparse=metadata.mask_r_sparse.clone(),
+    )
+
+    dense_only.assert_valid()
+    sparse_only.assert_valid()
+    return dense_only, sparse_only

@@ -37,6 +37,31 @@ class MixedSDDMMLaunchMetadata:
     def total_programs(self) -> int:
         return self.dense_programs + self.sparse_programs
 
+    @property
+    def dense_program_offset(self) -> int:
+        return 0
+
+    @property
+    def sparse_program_offset(self) -> int:
+        return self.dense_programs
+
+    @property
+    def dense_program_range(self) -> range:
+        return range(self.dense_program_offset, self.dense_program_offset + self.dense_programs)
+
+    @property
+    def sparse_program_range(self) -> range:
+        return range(self.sparse_program_offset, self.sparse_program_offset + self.sparse_programs)
+
+
+@dataclass(frozen=True)
+class MixedSDDMMProgramAssignment:
+    pid: int
+    region: str
+    slot: int
+    tile_m: int
+    tile_n: int
+
 
 @dataclass(frozen=True)
 class MixedSDDMMTritonResult:
@@ -128,6 +153,70 @@ def build_mixed_sddmm_launch_metadata(
         dense_programs=dense_programs,
         sparse_programs=sparse_programs,
     )
+
+
+def _decode_dense_program_id(
+    pid: int,
+    launch_metadata: MixedSDDMMLaunchMetadata,
+) -> tuple[int, int, int]:
+    programs_per_expert = launch_metadata.dense_tiles_m * launch_metadata.tiles_n
+    dense_slot = pid // programs_per_expert
+    local_pid = pid % programs_per_expert
+    pids_per_dense_group = launch_metadata.dense_group_m * launch_metadata.tiles_n
+    dense_group_id = local_pid // pids_per_dense_group
+    first_tile_m = dense_group_id * launch_metadata.dense_group_m
+    remaining_tile_m = launch_metadata.dense_tiles_m - first_tile_m
+    dense_group_size_m = min(remaining_tile_m, launch_metadata.dense_group_m)
+    dense_group_pid = local_pid % pids_per_dense_group
+    tile_m = first_tile_m + (dense_group_pid % dense_group_size_m)
+    tile_n = dense_group_pid // dense_group_size_m
+    return dense_slot, tile_m, tile_n
+
+
+def _decode_sparse_program_id(
+    sparse_pid: int,
+    launch_metadata: MixedSDDMMLaunchMetadata,
+) -> tuple[int, int, int]:
+    programs_per_expert = launch_metadata.sparse_tiles_m * launch_metadata.tiles_n
+    sparse_slot = sparse_pid // programs_per_expert
+    local_pid = sparse_pid % programs_per_expert
+    tile_m = local_pid // launch_metadata.tiles_n
+    tile_n = local_pid % launch_metadata.tiles_n
+    return sparse_slot, tile_m, tile_n
+
+
+def build_mixed_sddmm_program_map(
+    metadata: MixedSDDMMMetadata,
+    launch_metadata: MixedSDDMMLaunchMetadata,
+) -> list[MixedSDDMMProgramAssignment]:
+    metadata.assert_valid()
+    assignments: list[MixedSDDMMProgramAssignment] = []
+
+    for pid in launch_metadata.dense_program_range:
+        dense_slot, tile_m, tile_n = _decode_dense_program_id(pid, launch_metadata)
+        assignments.append(
+            MixedSDDMMProgramAssignment(
+                pid=pid,
+                region="dense",
+                slot=dense_slot,
+                tile_m=tile_m,
+                tile_n=tile_n,
+            )
+        )
+
+    for pid in launch_metadata.sparse_program_range:
+        sparse_slot, tile_m, tile_n = _decode_sparse_program_id(pid - launch_metadata.sparse_program_offset, launch_metadata)
+        assignments.append(
+            MixedSDDMMProgramAssignment(
+                pid=pid,
+                region="sparse",
+                slot=sparse_slot,
+                tile_m=tile_m,
+                tile_n=tile_n,
+            )
+        )
+
+    return assignments
 
 
 if triton is not None:
@@ -345,6 +434,92 @@ if triton is not None:
         )
         tl.store(output_ptr, output, mask=row_mask[:, None] & col_mask[None, :])
 
+    @triton.jit
+    def _sparse_only_sddmm_kernel(
+        x_ptr,
+        up_ptr,
+        gate_ptr,
+        mask_c_sparse_ptr,
+        mask_r_sparse_ptr,
+        mask_v_ptr,
+        hidden_dim,
+        expert_block_size,
+        maxnnz,
+        sparse_tiles_m,
+        tiles_n,
+        stride_x_batch,
+        stride_x_hidden,
+        stride_proj_out,
+        stride_proj_hidden,
+        stride_mask_r_row,
+        stride_mask_r_col,
+        stride_mask_v_row,
+        stride_mask_v_width,
+        stride_mask_v_col,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        programs_per_expert = sparse_tiles_m * tiles_n
+        sparse_slot = pid // programs_per_expert
+        local_pid = pid % programs_per_expert
+        tile_m = local_pid // tiles_n
+        tile_n = local_pid % tiles_n
+
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        row_ids = tile_m * BLOCK_M + offs_m
+        col_ids = tile_n * BLOCK_N + offs_n
+        row_mask = row_ids < maxnnz
+        col_mask = col_ids < expert_block_size
+
+        token_rows = tl.load(
+            mask_r_sparse_ptr + row_ids * stride_mask_r_row + sparse_slot * stride_mask_r_col,
+            mask=row_mask,
+            other=0,
+        )
+        expert_idx = tl.load(mask_c_sparse_ptr + sparse_slot)
+        expert_offset = expert_idx * expert_block_size
+        up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k_start in range(0, hidden_dim, BLOCK_K):
+            k_ids = k_start + offs_k
+            k_mask = k_ids < hidden_dim
+
+            x_tile = tl.load(
+                x_ptr + token_rows[:, None] * stride_x_batch + k_ids[None, :] * stride_x_hidden,
+                mask=row_mask[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            up_tile = tl.load(
+                up_ptr
+                + (expert_offset + col_ids[None, :]) * stride_proj_out
+                + k_ids[:, None] * stride_proj_hidden,
+                mask=k_mask[:, None] & col_mask[None, :],
+                other=0.0,
+            )
+            gate_tile = tl.load(
+                gate_ptr
+                + (expert_offset + col_ids[None, :]) * stride_proj_out
+                + k_ids[:, None] * stride_proj_hidden,
+                mask=k_mask[:, None] & col_mask[None, :],
+                other=0.0,
+            )
+            up_acc += tl.dot(x_tile, up_tile)
+            gate_acc += tl.dot(x_tile, gate_tile)
+
+        output = up_acc * (gate_acc * tl.sigmoid(gate_acc))
+        output_ptr = (
+            mask_v_ptr
+            + row_ids[:, None] * stride_mask_v_row
+            + sparse_slot * stride_mask_v_width
+            + col_ids[None, :] * stride_mask_v_col
+        )
+        tl.store(output_ptr, output, mask=row_mask[:, None] & col_mask[None, :])
+
 
 def launch_dense_only_sddmm_triton(
     x: torch.Tensor,
@@ -420,7 +595,7 @@ def launch_dense_only_sddmm_triton(
     )
 
 
-def launch_mixed_sddmm_triton(
+def launch_sparse_only_sddmm_triton(
     x: torch.Tensor,
     up_proj: torch.Tensor,
     gate_proj: torch.Tensor,
@@ -432,7 +607,83 @@ def launch_mixed_sddmm_triton(
     dense_group_m: int = 4,
     num_warps: int = 4,
     num_stages: int = 2,
-    use_dense_only_fast_path: bool = True,
+) -> MixedSDDMMTritonResult:
+    _check(metadata.dense_width == 0, "sparse-only launcher requires dense_width == 0")
+    _validate_triton_inputs(x, up_proj, gate_proj, metadata)
+
+    _, hidden_dim = x.shape
+    launch_metadata = build_mixed_sddmm_launch_metadata(
+        metadata,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        dense_group_m=dense_group_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    mask_c_sparse = metadata.mask_c_sparse.contiguous().to(dtype=torch.int32)
+    mask_r_sparse = metadata.mask_r_sparse.contiguous().to(dtype=torch.int32)
+    ir_dense, mask_v_sparse = metadata.allocate_output_buffers(dtype=x.dtype, device=x.device)
+
+    if launch_metadata.sparse_programs == 0:
+        return MixedSDDMMTritonResult(
+            ir_dense=ir_dense,
+            mask_v_sparse=mask_v_sparse,
+            launch_metadata=launch_metadata,
+            kernel_variant="sparse_only",
+        )
+
+    grid = (launch_metadata.sparse_programs,)
+    _sparse_only_sddmm_kernel[grid](
+        x,
+        up_proj,
+        gate_proj,
+        mask_c_sparse,
+        mask_r_sparse,
+        mask_v_sparse,
+        hidden_dim,
+        metadata.expert_block_size,
+        metadata.maxnnz,
+        launch_metadata.sparse_tiles_m,
+        launch_metadata.tiles_n,
+        x.stride(0),
+        x.stride(1),
+        up_proj.stride(0),
+        up_proj.stride(1),
+        mask_r_sparse.stride(0),
+        mask_r_sparse.stride(1),
+        mask_v_sparse.stride(0),
+        mask_v_sparse.stride(1),
+        mask_v_sparse.stride(2),
+        BLOCK_M=launch_metadata.block_m,
+        BLOCK_N=launch_metadata.block_n,
+        BLOCK_K=launch_metadata.block_k,
+        num_warps=launch_metadata.num_warps,
+        num_stages=launch_metadata.num_stages,
+    )
+
+    metadata.assert_output_shapes(ir_dense=ir_dense, mask_v_sparse=mask_v_sparse)
+    return MixedSDDMMTritonResult(
+        ir_dense=ir_dense,
+        mask_v_sparse=mask_v_sparse,
+        launch_metadata=launch_metadata,
+        kernel_variant="sparse_only",
+    )
+
+
+def _launch_generic_mixed_sddmm_triton(
+    x: torch.Tensor,
+    up_proj: torch.Tensor,
+    gate_proj: torch.Tensor,
+    metadata: MixedSDDMMMetadata,
+    *,
+    block_m: int = 32,
+    block_n: int = 64,
+    block_k: int = 32,
+    dense_group_m: int = 4,
+    num_warps: int = 4,
+    num_stages: int = 2,
 ) -> MixedSDDMMTritonResult:
     _validate_triton_inputs(x, up_proj, gate_proj, metadata)
     _, hidden_dim = x.shape
@@ -447,28 +698,12 @@ def launch_mixed_sddmm_triton(
         num_stages=num_stages,
     )
 
-    if use_dense_only_fast_path and metadata.sparse_width == 0:
-        return launch_dense_only_sddmm_triton(
-            x,
-            up_proj,
-            gate_proj,
-            metadata,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            dense_group_m=dense_group_m,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-
     mask_c_dense = metadata.mask_c_dense.contiguous().to(dtype=torch.int32)
     mask_c_sparse = metadata.mask_c_sparse.contiguous().to(dtype=torch.int32)
     mask_r_sparse = metadata.mask_r_sparse.contiguous().to(dtype=torch.int32)
     ir_dense, mask_v_sparse = metadata.allocate_output_buffers(dtype=x.dtype, device=x.device)
 
-    total_programs = launch_metadata.total_programs
-
-    if total_programs == 0:
+    if launch_metadata.total_programs == 0:
         return MixedSDDMMTritonResult(
             ir_dense=ir_dense,
             mask_v_sparse=mask_v_sparse,
@@ -476,7 +711,7 @@ def launch_mixed_sddmm_triton(
             kernel_variant="mixed",
         )
 
-    grid = (total_programs,)
+    grid = (launch_metadata.total_programs,)
     _mixed_sddmm_kernel[grid](
         x,
         up_proj,
@@ -521,4 +756,101 @@ def launch_mixed_sddmm_triton(
         mask_v_sparse=mask_v_sparse,
         launch_metadata=launch_metadata,
         kernel_variant="mixed",
+    )
+
+
+def launch_mixed_only_sddmm_triton(
+    x: torch.Tensor,
+    up_proj: torch.Tensor,
+    gate_proj: torch.Tensor,
+    metadata: MixedSDDMMMetadata,
+    *,
+    block_m: int = 32,
+    block_n: int = 64,
+    block_k: int = 32,
+    dense_group_m: int = 4,
+    num_warps: int = 4,
+    num_stages: int = 2,
+) -> MixedSDDMMTritonResult:
+    _check(metadata.dense_width > 0, "mixed-only launcher requires dense_width > 0")
+    _check(metadata.sparse_width > 0, "mixed-only launcher requires sparse_width > 0")
+    return _launch_generic_mixed_sddmm_triton(
+        x,
+        up_proj,
+        gate_proj,
+        metadata,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        dense_group_m=dense_group_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
+def launch_mixed_sddmm_triton(
+    x: torch.Tensor,
+    up_proj: torch.Tensor,
+    gate_proj: torch.Tensor,
+    metadata: MixedSDDMMMetadata,
+    *,
+    block_m: int = 32,
+    block_n: int = 64,
+    block_k: int = 32,
+    dense_group_m: int = 4,
+    num_warps: int = 4,
+    num_stages: int = 2,
+    use_dense_only_fast_path: bool = True,
+    use_sparse_only_fast_path: bool = True,
+) -> MixedSDDMMTritonResult:
+    _validate_triton_inputs(x, up_proj, gate_proj, metadata)
+    _, hidden_dim = x.shape
+
+    launch_metadata = build_mixed_sddmm_launch_metadata(
+        metadata,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        dense_group_m=dense_group_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    if use_dense_only_fast_path and metadata.sparse_width == 0:
+        return launch_dense_only_sddmm_triton(
+            x,
+            up_proj,
+            gate_proj,
+            metadata,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            dense_group_m=dense_group_m,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    if use_sparse_only_fast_path and metadata.dense_width == 0:
+        return launch_sparse_only_sddmm_triton(
+            x,
+            up_proj,
+            gate_proj,
+            metadata,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            dense_group_m=dense_group_m,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    return _launch_generic_mixed_sddmm_triton(
+        x,
+        up_proj,
+        gate_proj,
+        metadata,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        dense_group_m=dense_group_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

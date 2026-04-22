@@ -86,7 +86,7 @@ build_extension() {
 
 discover_tests
 if [[ "${RUN_MIXED_SDDMM_BENCH:-0}" == "1" ]]; then
-    echo "[run_test] Dense-only speed benchmarks enabled"
+    echo "[run_test] Triton speed benchmarks enabled"
 fi
 if [[ "${RUN_MIXED_SDDMM_TUNE:-0}" == "1" ]]; then
     echo "[run_test] Dense-only parameter sweep enabled"
