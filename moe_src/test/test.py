@@ -1,12 +1,23 @@
+import os
 import random
 from pathlib import Path
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 
+MOE_ROOT = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(MOE_ROOT) not in sys.path:
+    sys.path.insert(0, str(MOE_ROOT))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import mlp_kernel
+from sddmm_validation import MixedSDDMMMetadata
+from triton_kernels import launch_mixed_sddmm_triton
 
 
 def print_dif(x, y, eps=1e-5, print_it=True):
@@ -107,21 +118,32 @@ class MLP(nn.Module):
 
 
 class TestCUDAMoe(nn.Module):
-    def __init__(self, hid_dim, t_d, maxnnz, cuda_module=None):
+    def __init__(
+        self,
+        hid_dim,
+        t_d,
+        maxnnz,
+        cuda_module=None,
+        num_experts=128,
+        expert_w=512,
+        top_k=8,
+        sp_pd=1,
+        single_batch=64,
+    ):
         super().__init__()
-        self.num_experts = 16
-        self.expert_w = 512
-        self.top_k = 2
+        self.num_experts = num_experts
+        self.expert_w = expert_w
+        self.top_k = top_k
         self.norm_topk_prob = True
         self.cuda_module = cuda_module
         self.hid_dim = hid_dim
         
         self.t_d = t_d
         self.maxnnz = maxnnz
-        self.sp_pd = 1
-        self.single_batch = 64
+        self.sp_pd = sp_pd
+        self.single_batch = single_batch
 
-        self.gate = nn.Linear(hid_dim, 16, bias=False, dtype=torch.float16)
+        self.gate = nn.Linear(hid_dim, self.num_experts, bias=False, dtype=torch.float16)
         self.experts = nn.ModuleList(
             [MLP(hid_dim, self.expert_w) for _ in range(self.num_experts)]
         )
@@ -199,6 +221,233 @@ class TestCUDAMoe(nn.Module):
                 "intermediates in 128-column tiles, so the intermediate buffer layout is "
                 "not aligned with the configured expert stride."
             )
+
+    def build_legacy_sparse_layout(
+        self,
+        routing_weights: torch.Tensor,
+        sparse_routing_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dense_width = self.t_d
+        sparse_width = self.t_d // self.sp_pd
+        routing_n = torch.count_nonzero(routing_weights, dim=0)
+        mask_c = torch.topk(routing_n, dense_width + sparse_width).indices.contiguous()
+        if sparse_width == 0 or self.maxnnz == 0:
+            mask_r = torch.empty((self.maxnnz, sparse_width), dtype=torch.long, device=routing_weights.device)
+        else:
+            mask_r = sparse_routing_weights[:, mask_c[dense_width:]].topk(self.maxnnz, dim=0).indices.contiguous()
+        return mask_c, mask_r
+
+    def build_triton_metadata(
+        self,
+        batch_size: int,
+        mask_c: torch.Tensor,
+        mask_r: torch.Tensor,
+    ) -> MixedSDDMMMetadata:
+        dense_width = self.t_d
+        sparse_width = self.t_d // self.sp_pd
+        metadata = MixedSDDMMMetadata(
+            batch_size=batch_size,
+            num_experts=self.num_experts,
+            expert_block_size=self.expert_w,
+            dense_width=dense_width,
+            sparse_width=sparse_width,
+            maxnnz=self.maxnnz,
+            mask_c_dense=mask_c[:dense_width].contiguous().to(dtype=torch.long),
+            mask_c_sparse=mask_c[dense_width:].contiguous().to(dtype=torch.long),
+            mask_r_sparse=mask_r.contiguous().to(dtype=torch.long),
+        )
+        metadata.assert_valid()
+        return metadata
+
+    def launch_triton_sddmm(
+        self,
+        x: torch.Tensor,
+        mask_c: torch.Tensor,
+        mask_r: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        metadata = self.build_triton_metadata(x.size(0), mask_c, mask_r)
+        triton_result = launch_mixed_sddmm_triton(x, self.u, self.g, metadata)
+        ir = triton_result.ir_dense.reshape(x.size(0), self.t_d * self.expert_w)
+        mask_v = triton_result.mask_v_sparse.reshape(self.maxnnz, (self.t_d // self.sp_pd) * self.expert_w)
+        return ir, mask_v
+
+    def launch_cuda_sddmm(
+        self,
+        x: torch.Tensor,
+        mask_c: torch.Tensor,
+        mask_r: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ir = torch.zeros(x.size(0), self.t_d * self.expert_w, dtype=x.dtype, device=x.device)
+        mask_v = torch.zeros(
+            self.maxnnz,
+            (self.t_d // self.sp_pd) * self.expert_w,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        mlp_kernel.ops.sddmm(
+            x, self.u, self.g, ir, mask_r, mask_c, mask_v,
+            x.size(0), x.size(1), self.num_experts * self.expert_w, self.expert_w, self.t_d, self.maxnnz,
+        )
+        return ir, mask_v
+
+    def build_sparse_routing_weights(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        router_logits = self.gate(x)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
+        values, indices = torch.topk(routing_weights, k=self.top_k, dim=1)
+        values.div_(values.sum(1, keepdim=True))
+        sparse_routing_weights = torch.zeros_like(routing_weights)
+        sparse_routing_weights.scatter_(1, indices, values)
+        return sparse_routing_weights.to(x.dtype), sparse_routing_weights
+
+    def record_elapsed_time(self, elapsed_time: float) -> None:
+        self.data.append(elapsed_time)
+        if len(self.data) > 500 and (len(self.data) - 500) % 500 == 0:
+            warmup_data = self.data[500:len(self.data)]
+            avg_time = sum(warmup_data) / len(warmup_data)
+            print(f"Average time for iterations {501}-{len(self.data)}: {avg_time:.4f} ms")
+
+    def report_selected_forward(
+        self,
+        x_ref: torch.Tensor,
+        x: torch.Tensor,
+        ir: torch.Tensor,
+        mask_v: torch.Tensor,
+        routing_weights: torch.Tensor,
+        mask_c: torch.Tensor,
+        mask_r: torch.Tensor,
+    ) -> None:
+        ref = self.build_full_reference(x_ref)
+        print("Dense SDDMM vs PyTorch oracle:")
+        print_dense_dif(ir, ref, mask_c[:self.t_d], self.expert_w, ref.abs().max()/200)
+        print("Sparse SDDMM vs PyTorch oracle:")
+        print_select_dif(mask_v, ref, mask_r, mask_c[self.t_d:], self.expert_w, ref.abs().max()/200)
+
+        replay_ref = self.build_spmm_replay_output(ir, mask_v, routing_weights, mask_c, mask_r)
+        print("End-to-end replay using kernel intermediates:")
+        print_dif(x, replay_ref, replay_ref.abs().max()/200)
+
+        selected_oracle_ref = self.build_selected_oracle_output(ref, routing_weights, mask_c, mask_r)
+        print("End-to-end selected-row oracle:")
+        print_dif(x, selected_oracle_ref, selected_oracle_ref.abs().max()/200)
+
+        full_oracle_ref = self.build_full_moe_output(ref, routing_weights)
+        print("End-to-end full MoE oracle:")
+        print_dif(x, full_oracle_ref, full_oracle_ref.abs().max()/200)
+
+    def _forward_selected(
+        self,
+        hid: torch.Tensor,
+        *,
+        sddmm_launcher,
+        verbose: bool = True,
+        record_time: bool = True,
+    ) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hid.shape
+        x = hid.view(-1, hidden_dim)
+        bs = x.size(0)
+        x_ref = x.clone()
+
+        start_event = None
+        end_event = None
+        if record_time:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+
+        with torch.no_grad():
+            routing_weights, sparse_routing_weights = self.build_sparse_routing_weights(x)
+            t_d, maxnnz = self.t_d, self.maxnnz
+
+            self.report_layout_assumption()
+
+            mask_c, mask_r = self.build_legacy_sparse_layout(routing_weights, sparse_routing_weights)
+            result = torch.zeros(t_d, bs, self.hid_dim, dtype=x.dtype, device=x.device)
+
+            if start_event is not None:
+                start_event.record()
+
+            ir, mask_v = sddmm_launcher(x, mask_c, mask_r)
+
+            mlp_kernel.ops.spmm(
+                ir, self.d, result, mask_r, mask_c, mask_v, routing_weights,
+                bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, t_d, maxnnz,
+            )
+            x = result.sum(0)
+
+            if end_event is not None:
+                end_event.record()
+
+        torch.cuda.synchronize()
+        if start_event is not None and end_event is not None:
+            self.record_elapsed_time(start_event.elapsed_time(end_event))
+
+        if verbose:
+            self.report_selected_forward(x_ref, x, ir, mask_v, routing_weights, mask_c, mask_r)
+
+        return x.view(batch_size, sequence_length, hidden_dim)
+
+    def _measure_cuda_ms(
+        self,
+        fn,
+        *,
+        warmup: int = 20,
+        iters: int = 50,
+    ) -> float:
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        for i in range(iters):
+            start_events[i].record()
+            fn()
+            end_events[i].record()
+        torch.cuda.synchronize()
+
+        timings = [start.elapsed_time(end) for start, end in zip(start_events, end_events)]
+        timings.sort()
+        return float(timings[len(timings) // 2])
+
+    def benchmark_forward_paths(
+        self,
+        hid: torch.Tensor,
+        *,
+        warmup: int = 20,
+        iters: int = 50,
+    ) -> dict[str, float]:
+        timings = {
+            "cuda_operator_ms": self._measure_cuda_ms(
+                lambda: self.forward_cuda(hid, verbose=False, record_time=False),
+                warmup=warmup,
+                iters=iters,
+            ),
+            "triton_operator_ms": self._measure_cuda_ms(
+                lambda: self.forward_triton(hid, verbose=False, record_time=False),
+                warmup=warmup,
+                iters=iters,
+            ),
+            "torch_bmm_ms": self._measure_cuda_ms(
+                lambda: self.dense_forward(hid),
+                warmup=warmup,
+                iters=iters,
+            ),
+        }
+        print(
+            "[speed] "
+            f"cuda_operator_ms={timings['cuda_operator_ms']:.4f} "
+            f"triton_operator_ms={timings['triton_operator_ms']:.4f} "
+            f"torch_bmm_ms={timings['torch_bmm_ms']:.4f}"
+        )
+        print(
+            "[speed] "
+            f"triton_vs_cuda={timings['triton_operator_ms'] / timings['cuda_operator_ms']:.4f} "
+            f"triton_vs_bmm={timings['triton_operator_ms'] / timings['torch_bmm_ms']:.4f} "
+            f"cuda_vs_bmm={timings['cuda_operator_ms'] / timings['torch_bmm_ms']:.4f}"
+        )
+        return timings
     
     def rand_init(self):
         self.gate.weight.data = torch.rand_like(self.gate.weight) / 5
@@ -281,84 +530,24 @@ class TestCUDAMoe(nn.Module):
 
         return x.view(batch_size, sequence_length, hidden_dim)
     
+    def forward_cuda(self, hid, *, verbose: bool = True, record_time: bool = True):
+        return self._forward_selected(
+            hid,
+            sddmm_launcher=self.launch_cuda_sddmm,
+            verbose=verbose,
+            record_time=record_time,
+        )
+
+    def forward_triton(self, hid, *, verbose: bool = True, record_time: bool = True):
+        return self._forward_selected(
+            hid,
+            sddmm_launcher=self.launch_triton_sddmm,
+            verbose=verbose,
+            record_time=record_time,
+        )
+
     def forward(self, hid):
-        batch_size, sequence_length, hidden_dim = hid.shape
-        x = hid.view(-1, hidden_dim)
-        bs = x.size(0)
-        
-        x_ref = x.clone()
-        
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        with torch.no_grad():
-            router_logits = self.gate(x)
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            values, indices = torch.topk(routing_weights, k=self.top_k, dim=1)
-            values.div_(values.sum(1, keepdim=True))
-            sparse_routing_weights = torch.zeros_like(routing_weights)
-            sparse_routing_weights.scatter_(1, indices, values)
-            routing_weights = sparse_routing_weights.to(x.dtype)
-
-            # flat_indices = indices.view(-1)
-            # counts = torch.bincount(flat_indices, minlength=routing_weights.size(1))
-            # routing_n4 = (counts > 4).sum().item()
-            # routing_n1 = (counts > 0).sum().item() // 2
-            # t_d, maxnnz = max(routing_n1, routing_n4), 4
-
-            routing_n = torch.count_nonzero(routing_weights, dim=0)
-            t_d, maxnnz = self.t_d, self.maxnnz
-
-            self.report_layout_assumption()
-
-            ir = torch.zeros(bs, t_d * self.expert_w, dtype=x.dtype, device=x.device)
-            mask_c = torch.topk(routing_n, t_d // self.sp_pd + t_d).indices
-            mask_r = sparse_routing_weights[:, mask_c[t_d:]].topk(maxnnz, dim=0).indices
-            mask_v = torch.zeros(maxnnz, (t_d // self.sp_pd) * self.expert_w,
-                                 dtype=x.dtype, device=x.device)
-            result = torch.zeros(t_d, bs, self.hid_dim, dtype=x.dtype, device=x.device)
-        
-            start_event.record()
-
-            mlp_kernel.ops.sddmm(
-                x, self.u, self.g, ir, mask_r, mask_c, mask_v,
-                bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, t_d, maxnnz)
-
-            mlp_kernel.ops.spmm(
-                ir, self.d, result, mask_r, mask_c, mask_v, routing_weights,
-                bs, hidden_dim, self.num_experts * self.expert_w, self.expert_w, t_d, maxnnz)
-            
-            x = result.sum(0)
-        
-        end_event.record()
-        
-        torch.cuda.synchronize()
-        elapsed_time = start_event.elapsed_time(end_event)
-        self.data.append(elapsed_time)
-        if len(self.data) > 500 and (len(self.data) - 500) % 500 == 0:
-            warmup_data = self.data[500:len(self.data)]
-            avg_time = sum(warmup_data) / len(warmup_data)
-            print(f"Average time for iterations {501}-{len(self.data)}: {avg_time:.4f} ms")
-        
-        ref = self.build_full_reference(x_ref)
-        print("Dense SDDMM vs PyTorch oracle:")
-        print_dense_dif(ir, ref, mask_c[:self.t_d], self.expert_w, ref.abs().max()/200)
-        print("Sparse SDDMM vs PyTorch oracle:")
-        print_select_dif(mask_v, ref, mask_r, mask_c[self.t_d:], self.expert_w, ref.abs().max()/200)
-
-        replay_ref = self.build_spmm_replay_output(ir, mask_v, routing_weights, mask_c, mask_r)
-        print("End-to-end replay using kernel intermediates:")
-        print_dif(x, replay_ref, replay_ref.abs().max()/200)
-
-        selected_oracle_ref = self.build_selected_oracle_output(ref, routing_weights, mask_c, mask_r)
-        print("End-to-end selected-row oracle:")
-        print_dif(x, selected_oracle_ref, selected_oracle_ref.abs().max()/200)
-
-        full_oracle_ref = self.build_full_moe_output(ref, routing_weights)
-        print("End-to-end full MoE oracle:")
-        print_dif(x, full_oracle_ref, full_oracle_ref.abs().max()/200)
-
-        return x.view(batch_size, sequence_length, hidden_dim)
+        return self.forward_triton(hid)
     
     def v3_forward(self, hid):
         batch_size, sequence_length, hidden_dim = hid.shape
@@ -367,12 +556,12 @@ class TestCUDAMoe(nn.Module):
         
         id_to_v = 0
         x_ref = x[id_to_v].clone()
-        
+
         st = torch.cuda.Event(enable_timing=True)
         ed = torch.cuda.Event(enable_timing=True)
         
         st.record()
-        
+
         router_logits = self.gate(x)  # shape: (nt, bs, num_experts)
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
         routing_weights_top8 = torch.topk(routing_weights, k=self.top_k, dim=-1)
@@ -449,16 +638,20 @@ class TestCUDAMoe(nn.Module):
     def dense_forward(self, x):
         batch_size, sequence_length, hidden_dim = x.shape
         x = x.view(-1, hidden_dim)
-        bs = x.size(0)
-        router_logits = self.gate(x)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=x.dtype)
+        with torch.no_grad():
+            routing_weights, _ = self.build_sparse_routing_weights(x)
+            x_batched = x.unsqueeze(0).expand(self.num_experts, -1, -1).contiguous()
+            up_weight = self.u.view(self.num_experts, self.expert_w, hidden_dim).transpose(1, 2)
+            gate_weight = self.g.view(self.num_experts, self.expert_w, hidden_dim).transpose(1, 2)
+            down_weight = self.d.view(self.hid_dim, self.num_experts, self.expert_w).permute(1, 2, 0)
 
-        dense_mid = self.num_experts * self.expert_w
-        ir = x @ self.u[:dense_mid].T * self.single.act_fn(x @ self.g[:dense_mid].T)
+            up_out = torch.bmm(x_batched, up_weight)
+            gate_out = torch.bmm(x_batched, gate_weight)
+            ir = up_out * self.single.act_fn(gate_out)
+            expert_out = torch.bmm(ir, down_weight)
+            x = (expert_out * routing_weights.transpose(0, 1).unsqueeze(-1)).sum(0)
 
-        x = ir @ self.d.T[:dense_mid]
-                
-        return x
+        return x.view(batch_size, sequence_length, hidden_dim)
     
     def moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -490,13 +683,13 @@ class TestCUDAMoe(nn.Module):
         
     
 
-if __name__ == "__main__":
+def main():
     set_all_seed()
     # torch.set_printoptions(
     #     precision=2,        # 保留2位小数
     #     sci_mode=False,     # 不使用科学计数法
     # )
-    hid_dim = 4096
+    hid_dim = 2048
     # cutlass_path = "/share/public/zhouyongkang/projects/sc/deps/cutlass"
     # dsmm_path = "/share/public/zhouyongkang/projects/sc/moe_src"
     # build_path = "/share/public/zhouyongkang/projects/sc/moe_src/build"
@@ -513,9 +706,9 @@ if __name__ == "__main__":
     #         '-Xptxas', '-v',
     #         '-g', '-lineinfo',
     #     ])
-    t_d = 32
+    # t_d = 64
     maxnnz = 4
-    for t_d in [8]:
+    for t_d in [16, 32, 48, 64]:
     # for t_d in range(24, 40):
     # for maxnnz in range(1, 9):
         tc = TestCUDAMoe(hid_dim, t_d, maxnnz)
@@ -524,9 +717,80 @@ if __name__ == "__main__":
         tc = tc.to('cuda')
         x = (torch.rand(1, 64, hid_dim, device='cuda', dtype=torch.float16)-0.5) / 2
 
-        for _ in range(1):
-            tc(x)
+        # for _ in range(1):
+        #     tc(x)
             # tc.test_forward(x)
             # tc.moe_forward(x)
             # tc.dense_forward(x)
+        if os.getenv("RUN_FORWARD_SPEED", "0") == "1":
+            tc.benchmark_forward_paths(x, warmup=20, iters=50)
         print('-'*50)
+
+
+def main_v2():
+    set_all_seed()
+
+    warmup = int(os.getenv("MOE_SPEED_WARMUP", "20"))
+    iters = int(os.getenv("MOE_SPEED_ITERS", "50"))
+    base_cases = [
+        {
+            "name": "all",
+            "hid_dim": 2048,
+            "num_experts": 128,
+            "expert_w": 512,
+            "top_k": 8,
+            "sp_pd": 1,
+            "batch_sizes": [1],
+            "seq_lengths": [64, 128],
+            "t_d_values": [16, 32, 48, 64],
+            "maxnnz_values": [4, 8],
+        },
+    ]
+
+    print(f"[main_v2] speed-only benchmark warmup={warmup} iters={iters}")
+    for case in base_cases:
+        print(f"[main_v2] case={case['name']}")
+        for batch_size in case["batch_sizes"]:
+            for sequence_length in case["seq_lengths"]:
+                for t_d in case["t_d_values"]:
+                    for maxnnz in case["maxnnz_values"]:
+                        if maxnnz > batch_size * sequence_length:
+                            continue
+
+                        tc = TestCUDAMoe(
+                            case["hid_dim"],
+                            t_d,
+                            maxnnz,
+                            num_experts=case["num_experts"],
+                            expert_w=case["expert_w"],
+                            top_k=case["top_k"],
+                            sp_pd=case["sp_pd"],
+                        )
+                        tc.rand_init()
+                        tc = tc.to("cuda")
+                        x = (
+                            torch.rand(
+                                batch_size,
+                                sequence_length,
+                                case["hid_dim"],
+                                device="cuda",
+                                dtype=torch.float16,
+                            )
+                            - 0.5
+                        ) / 2
+
+                        print(
+                            "[main_v2] "
+                            f"bs={batch_size} seq={sequence_length} tokens={batch_size * sequence_length} "
+                            f"hid_dim={case['hid_dim']} num_experts={case['num_experts']} "
+                            f"expert_w={case['expert_w']} top_k={case['top_k']} "
+                            f"t_d={t_d} sp_pd={case['sp_pd']} maxnnz={maxnnz}"
+                        )
+                        tc.benchmark_forward_paths(x, warmup=warmup, iters=iters)
+                        del x, tc
+                        torch.cuda.empty_cache()
+        print("-" * 50)
+
+
+if __name__ == "__main__":
+    main_v2()

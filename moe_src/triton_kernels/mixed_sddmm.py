@@ -282,7 +282,7 @@ if triton is not None:
             row_mask = row_ids < batch_size
             col_mask = col_ids < expert_block_size
 
-            token_rows = row_ids
+            token_rows = row_ids.to(tl.int64)
             expert_idx = tl.load(mask_c_dense_ptr + dense_slot)
             output_ptr = (
                 ir_ptr
@@ -548,7 +548,7 @@ def launch_dense_only_sddmm_triton(
         num_stages=num_stages,
     )
 
-    mask_c_dense = metadata.mask_c_dense.contiguous().to(dtype=torch.int32)
+    mask_c_dense = metadata.mask_c_dense.contiguous()
     ir_dense, mask_v_sparse = metadata.allocate_output_buffers(dtype=x.dtype, device=x.device)
 
     if launch_metadata.dense_programs == 0:
@@ -622,8 +622,8 @@ def launch_sparse_only_sddmm_triton(
         num_stages=num_stages,
     )
 
-    mask_c_sparse = metadata.mask_c_sparse.contiguous().to(dtype=torch.int32)
-    mask_r_sparse = metadata.mask_r_sparse.contiguous().to(dtype=torch.int32)
+    mask_c_sparse = metadata.mask_c_sparse.contiguous()
+    mask_r_sparse = metadata.mask_r_sparse.contiguous()
     ir_dense, mask_v_sparse = metadata.allocate_output_buffers(dtype=x.dtype, device=x.device)
 
     if launch_metadata.sparse_programs == 0:
@@ -698,9 +698,9 @@ def _launch_generic_mixed_sddmm_triton(
         num_stages=num_stages,
     )
 
-    mask_c_dense = metadata.mask_c_dense.contiguous().to(dtype=torch.int32)
-    mask_c_sparse = metadata.mask_c_sparse.contiguous().to(dtype=torch.int32)
-    mask_r_sparse = metadata.mask_r_sparse.contiguous().to(dtype=torch.int32)
+    mask_c_dense = metadata.mask_c_dense.contiguous()
+    mask_c_sparse = metadata.mask_c_sparse.contiguous()
+    mask_r_sparse = metadata.mask_r_sparse.contiguous()
     ir_dense, mask_v_sparse = metadata.allocate_output_buffers(dtype=x.dtype, device=x.device)
 
     if launch_metadata.total_programs == 0:

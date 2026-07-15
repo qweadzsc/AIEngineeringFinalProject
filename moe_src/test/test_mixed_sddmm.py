@@ -74,9 +74,13 @@ TUNED_LARGE_TOTAL_N_CONFIG = {
 }
 
 MIXED_SPEED_SPLIT_CASES = [
-    {"dense_width": 12, "sparse_width": 4},
-    {"dense_width": 8, "sparse_width": 8},
-    {"dense_width": 4, "sparse_width": 12},
+    {"dense_width": 16, "sparse_width": 112},
+    {"dense_width": 32, "sparse_width": 96},
+    {"dense_width": 48, "sparse_width": 80},
+    {"dense_width": 64, "sparse_width": 64},
+    {"dense_width": 80, "sparse_width": 48},
+    {"dense_width": 96, "sparse_width": 32},
+    {"dense_width": 112, "sparse_width": 16},
 ]
 
 
@@ -463,8 +467,8 @@ class MixedSDDMMTritonTest(unittest.TestCase):
         num_experts = total_rows // expert_block_size
 
         x_batched = x.unsqueeze(0).repeat(num_experts, 1, 1)
-        up_batched = up_proj.view(num_experts, expert_block_size, hidden_dim).transpose(1, 2).contiguous()
-        gate_batched = gate_proj.view(num_experts, expert_block_size, hidden_dim).transpose(1, 2).contiguous()
+        up_batched = up_proj.view(num_experts, expert_block_size, hidden_dim).transpose(1, 2)
+        gate_batched = gate_proj.view(num_experts, expert_block_size, hidden_dim).transpose(1, 2)
 
         up_out = torch.bmm(x_batched, up_batched)
         gate_out = torch.bmm(x_batched, gate_batched)
@@ -1358,7 +1362,7 @@ class MixedSDDMMTritonTest(unittest.TestCase):
         "Set RUN_MIXED_SDDMM_BENCH=1 to run the mixed-vs-dense torch bmm benchmark",
     )
     def test_mixed_vs_dense_torch_bmm_benchmark(self) -> None:
-        num_experts = 16
+        num_experts = 128
         hidden_dim = 2048
         expert_block_size = 512
 
@@ -1409,7 +1413,7 @@ class MixedSDDMMTritonTest(unittest.TestCase):
             )
             self.assertGreater(baseline_ms, 0.0)
 
-            maxnnz_values = sorted({value for value in [4, 8, 16, 32, batch_size] if value <= batch_size})
+            maxnnz_values = sorted({value for value in [4, 8, 16, 32] if value <= batch_size})
             for split_case in MIXED_SPEED_SPLIT_CASES:
                 dense_width = split_case["dense_width"]
                 sparse_width = split_case["sparse_width"]

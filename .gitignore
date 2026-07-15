@@ -29,3 +29,8 @@ deps/
 
 # codex
 codex/
+
+# moe benchmark artifacts
+moe_src/test/torch_cuda*_sweep.csv
+moe_src/test/torch_cuda*_sweep.png
+moe_src/test/torch_cuda*_sweep_metadata.txt
