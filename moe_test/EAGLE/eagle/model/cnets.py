@@ -495,7 +495,7 @@ class Model(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.lm_head=nn.Linear(config.hidden_size,config.draft_vocab_size,bias=False)
-        if load_emb and not hasattr(config, "target_hidden_size"):
+        if load_emb and getattr(config, "target_hidden_size", None) is None:
             from safetensors import safe_open
             import json
             try:
