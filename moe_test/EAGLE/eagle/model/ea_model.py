@@ -15,6 +15,7 @@ from .modeling_mixtral_kv import MixtralForCausalLM as KVMixtralForCausalLM
 from .modeling_qwen2_kv import Qwen2ForCausalLM as KVQwen2ForCausalLM
 from .modeling_qwen3_kv import Qwen3ForCausalLM as KVQwen3ForCausalLM
 from .modeling_qwen3moe_kv import Qwen3MoeForCausalLM as KVQwen3MoeForCausalLM
+from .modeling_gpt_oss_kv import GptOssForCausalLM as KVGptOssForCausalLM
 from .modeling_phimoe_kv import PhiMoEForCausalLM as KVPhiMoEForCausalLM
 from .utils import *
 from .kv_cache import initialize_past_key_values
@@ -22,6 +23,67 @@ from .kv_cache import initialize_past_key_values
 from .cnets import Model
 from .cnets1 import Model as Model1
 from .configs import EConfig
+
+
+def _normalize_eagle3_state_dict(ea_layer_state_dict):
+    normalized = {}
+    for name, tensor in ea_layer_state_dict.items():
+        if name.startswith("layers.0."):
+            name = name.replace("layers.0.", "midlayer.", 1)
+        normalized[name] = tensor
+    return normalized
+
+
+def _rebuild_exact_draft_to_target_offsets(module):
+    if not hasattr(module, "d2t") or not hasattr(module, "t2d"):
+        return
+    if module.t2d.dtype != torch.bool:
+        return
+
+    true_idx = module.t2d.nonzero(as_tuple=False).flatten()
+    if true_idx.numel() != module.d2t.numel():
+        return
+
+    draft_ids = torch.arange(
+        module.d2t.numel(),
+        device=true_idx.device,
+        dtype=true_idx.dtype,
+    )
+    exact_offsets = (true_idx - draft_ids).to(dtype=module.d2t.dtype)
+    if not torch.equal(module.d2t.cpu(), exact_offsets.cpu()):
+        module.d2t.copy_(exact_offsets.to(module.d2t.device))
+
+
+def _infer_speculator_runtime_params(config_json, total_token, depth, top_k):
+    spec_cfg = config_json.get("speculators_config")
+    if not isinstance(spec_cfg, dict):
+        return total_token, depth, top_k, None
+
+    default_method = spec_cfg.get("default_proposal_method")
+    proposal_methods = spec_cfg.get("proposal_methods") or []
+    selected = None
+    for method in proposal_methods:
+        if method.get("proposal_type") == default_method:
+            selected = method
+            break
+    if selected is None and proposal_methods:
+        selected = proposal_methods[0]
+    if not isinstance(selected, dict):
+        return total_token, depth, top_k, None
+
+    proposal_type = selected.get("proposal_type")
+    speculative_tokens = selected.get("speculative_tokens")
+    if proposal_type not in {"greedy", "sampling"} or not isinstance(speculative_tokens, int) or speculative_tokens <= 0:
+        return total_token, depth, top_k, None
+
+    inferred_total_token = speculative_tokens + 1
+    inferred_depth = max(speculative_tokens - 1, 0)
+    inferred_top_k = 1
+    note = (
+        f"Detected speculators_config: proposal_type={proposal_type}, speculative_tokens={speculative_tokens}; "
+        f"overriding total_token={inferred_total_token}, depth={inferred_depth}, top_k={inferred_top_k}"
+    )
+    return inferred_total_token, inferred_depth, inferred_top_k, note
 
 
 class EaModel(nn.Module):
@@ -56,6 +118,7 @@ class EaModel(nn.Module):
         except:
             bias = True
         if use_eagle3:
+            ea_layer_state_dict = _normalize_eagle3_state_dict(ea_layer_state_dict)
             self.ea_layer = Model(config, bias=bias, total_tokens=total_token, depth=depth, top_k=top_k,
                                   threshold=threshold, path=base_model_name_or_path,load_emb=True)
         else:
@@ -77,6 +140,7 @@ class EaModel(nn.Module):
         if self.use_eagle3 and config.vocab_size==config.draft_vocab_size:
             del self.ea_layer.d2t,self.ea_layer.t2d
         load_=self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
+        _rebuild_exact_draft_to_target_offsets(self.ea_layer)
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
 
@@ -106,11 +170,32 @@ class EaModel(nn.Module):
         configpath = os.path.join(ea_model_path, "config.json")
         if not os.path.exists(configpath):
             configpath = hf_hub_download(ea_model_path, "config.json")
+        with open(configpath, "r") as f:
+            config_json = json.load(f)
+        if use_eagle3:
+            total_token, depth, top_k, runtime_note = _infer_speculator_runtime_params(
+                config_json, total_token, depth, top_k
+            )
+            if runtime_note is not None:
+                print(runtime_note)
 
         load_model_path = os.path.join(ea_model_path, "pytorch_model.bin")
-        if not os.path.exists(load_model_path):
-            load_model_path = hf_hub_download(ea_model_path, "pytorch_model.bin")
-        ea_layer_state_dict = torch.load(load_model_path, map_location=torch.device('cuda'))
+        safetensors_path = os.path.join(ea_model_path, "model.safetensors")
+        if os.path.exists(load_model_path):
+            ea_layer_state_dict = torch.load(load_model_path, map_location=torch.device('cuda'))
+        elif os.path.exists(safetensors_path):
+            from safetensors.torch import load_file
+
+            ea_layer_state_dict = load_file(safetensors_path, device='cuda')
+        else:
+            try:
+                load_model_path = hf_hub_download(ea_model_path, "pytorch_model.bin")
+                ea_layer_state_dict = torch.load(load_model_path, map_location=torch.device('cuda'))
+            except Exception:
+                from safetensors.torch import load_file
+
+                safetensors_path = hf_hub_download(ea_model_path, "model.safetensors")
+                ea_layer_state_dict = load_file(safetensors_path, device='cuda')
 
         if Type == 'LlamaForCausalLM':
             base_model = KVLlamaForCausalLM.from_pretrained(
@@ -130,6 +215,10 @@ class EaModel(nn.Module):
             )
         elif Type == 'PhiMoEForCausalLM':
             base_model = KVPhiMoEForCausalLM.from_pretrained(
+                base_model_path, **kwargs
+            )
+        elif Type == 'GptOssForCausalLM':
+            base_model = KVGptOssForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
         else:

@@ -196,12 +196,12 @@ class LlamaAttention(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        if not hasattr(config, "head_dim") and (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
@@ -222,7 +222,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(self.head_dim,
                                                        max_position_embeddings=self.max_position_embeddings)
         else:
-            scaling_type = self.config.rope_scaling["type"]
+            scaling_type = self.config.rope_scaling.get("type", self.config.rope_scaling.get("rope_type"))
             scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
@@ -233,7 +233,12 @@ class LlamaAttention(nn.Module):
                     self.head_dim, max_position_embeddings=self.max_position_embeddings, scaling_factor=scaling_factor
                 )
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                base = self.config.rope_theta if hasattr(self.config, "rope_theta") else 10000
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=base,
+                )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -318,11 +323,12 @@ class LlamaAttention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output_dim = self.num_heads * self.head_dim
+        attn_output = attn_output.reshape(bsz, q_len, attn_output_dim)
 
         if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            attn_output = attn_output.split(attn_output_dim // self.config.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(attn_output_dim // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
             attn_output = self.o_proj(attn_output)
@@ -391,6 +397,7 @@ class LlamaDecoderLayeremb(nn.Module):
         self.self_attn = LlamaAttention(config=config)
         self.mlp = LlamaMLP(config)
         self.last = last
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -422,9 +429,12 @@ class LlamaDecoderLayeremb(nn.Module):
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
 
-        residual = hidden_states
-
-        hidden_states = self.hidden_norm(hidden_states)
+        if self.norm_before_residual:
+            hidden_states = self.hidden_norm(hidden_states)
+            residual = hidden_states
+        else:
+            residual = hidden_states
+            hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
@@ -527,11 +537,13 @@ class Model(nn.Module):
         # print("top_k",top_k)
         # print("threshold",threshold)
         self.hidden_size = config.hidden_size
+        self.target_hidden_size = getattr(config, "target_hidden_size", None) or config.hidden_size
+        self.norm_before_fc = getattr(config, "norm_before_fc", False)
         self.midlayer = LlamaDecoderLayeremb(config)
-        if hasattr(config, "target_hidden_size"):
-            self.fc = nn.Linear(config.target_hidden_size * 3, self.hidden_size, bias=False)
-        else:
-            self.fc = nn.Linear(config.hidden_size * 3, self.hidden_size, bias=False)
+        self.input_norm = None
+        if self.norm_before_fc:
+            self.input_norm = LlamaRMSNorm(self.target_hidden_size * 3, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(self.target_hidden_size * 3, self.hidden_size, bias=False)
         self.norm=LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.logsoftmax = nn.LogSoftmax(dim=-1)
 
@@ -636,7 +648,9 @@ class Model(nn.Module):
 
         # hidden_states=self.act(self.fc(torch.cat((inputs_embeds,hidden_states),dim=-1)))
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
-        if hidden_states.shape[-1]!=inputs_embeds.shape[-1]:
+        if hidden_states.shape[-1] != inputs_embeds.shape[-1]:
+            if self.input_norm is not None and hidden_states.shape[-1] == self.input_norm.weight.shape[0]:
+                hidden_states = self.input_norm(hidden_states)
             hidden_states = self.fc(hidden_states)
         # hidden_states = self.fc(hidden_states)
 

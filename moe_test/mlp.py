@@ -10,14 +10,6 @@ def print_diff(tensor1, tensor2, eps=3e-3):
     """
     Compares two tensors and prints the percentage of elements with an absolute difference
     greater than a calculated threshold.
-
-    Args:
-        tensor1 (torch.Tensor): The first input tensor.
-        tensor2 (torch.Tensor): The second input tensor.
-        eps (float): A small value used to calculate the threshold.
-
-    Raises:
-        AssertionError: If the shapes of the two input tensors do not match.
     """
     if tensor1.shape != tensor2.shape:
         raise AssertionError(f"Tensor shapes do not match: {tensor1.shape} vs {tensor2.shape}")
@@ -50,55 +42,92 @@ class SPMLP(nn.Module):
     ):
         super().__init__()
 
+        self.model_variant = None
+        self.supports_main_kernel = False
+        self.alpha = None
+        self.limit = None
+
         with torch.no_grad():
-            self.hidden_size = origin_mlp.experts[0].hidden_size
-            self.num_experts = origin_mlp.num_experts
-            self.top_k = origin_mlp.top_k
-            self.norm_topk_prob = getattr(origin_mlp, "norm_topk_prob", False)
+            if isinstance(getattr(origin_mlp, "experts", None), nn.ModuleList):
+                self._init_standard_moe(origin_mlp)
+            elif hasattr(getattr(origin_mlp, "experts", None), "gate_up_proj"):
+                self._init_gpt_oss_moe(origin_mlp)
+            else:
+                raise TypeError(f"Unsupported MLP type for SPMLP: {type(origin_mlp)!r}")
 
-            first_expert = origin_mlp.experts[0]
-            self.intermediate_size = first_expert.intermediate_size
-            self.total_intermediate_size = self.intermediate_size * self.num_experts
-            self.act_fn = first_expert.act_fn
-            dtype = first_expert.gate_proj.weight.dtype
-            device = first_expert.gate_proj.weight.device
-
-            self.combined_w1_weight = torch.empty(
-                self.total_intermediate_size,
-                self.hidden_size,
-                dtype=dtype,
-                device=device,
+        if forward_mode not in {"main", "bm"}:
+            raise ValueError(f"Unsupported forward mode: {forward_mode}")
+        if unsupported_batch_fallback_mode not in {"original", "bm"}:
+            raise ValueError(
+                f"Unsupported unsupported_batch_fallback_mode: {unsupported_batch_fallback_mode}"
             )
-            self.combined_w3_weight = torch.empty(
-                self.total_intermediate_size,
-                self.hidden_size,
-                dtype=dtype,
-                device=device,
-            )
-            self.combined_w2_weight = torch.empty(
-                self.hidden_size,
-                self.total_intermediate_size,
-                dtype=dtype,
-                device=device,
-            )
+        if runtime_t_d_fallback_mode not in {"none", "original", "bm"}:
+            raise ValueError(f"Unsupported runtime_t_d_fallback_mode: {runtime_t_d_fallback_mode}")
 
-            start_idx = 0
-            for expert in origin_mlp.experts:
-                end_idx = start_idx + self.intermediate_size
+        self.base_t_d = self.num_experts // 2 if t_d is None else t_d
+        self.t_d = self.base_t_d
+        self.maxnnz = 4
+        self.adaptive_t_d = adaptive_t_d
+        self.bm_fallback_t_d = self.base_t_d if bm_fallback_t_d is None else bm_fallback_t_d
+        self.forward_mode = forward_mode
+        self.unsupported_batch_fallback_mode = unsupported_batch_fallback_mode
+        self.runtime_t_d_fallback_mode = runtime_t_d_fallback_mode
 
-                self.combined_w1_weight[start_idx:end_idx, :] = expert.gate_proj.weight.data
-                self.combined_w3_weight[start_idx:end_idx, :] = expert.up_proj.weight.data
-                self.combined_w2_weight[:, start_idx:end_idx] = expert.down_proj.weight.data
+        self.kernel_path_calls = 0
+        self.unsupported_batch_fallback_calls = 0
+        self.runtime_t_d_fallback_calls = 0
+        self.original_forward_calls = 0
+        self.bm_forward_calls = 0
 
-                start_idx = end_idx
+    def _init_standard_moe(self, origin_mlp):
+        self.model_variant = "standard"
+        self.supports_main_kernel = True
 
-                del expert.gate_proj.weight
-                del expert.up_proj.weight
-                del expert.down_proj.weight
+        self.hidden_size = origin_mlp.experts[0].hidden_size
+        self.num_experts = origin_mlp.num_experts
+        self.top_k = origin_mlp.top_k
+        self.norm_topk_prob = getattr(origin_mlp, "norm_topk_prob", False)
 
-            del origin_mlp.experts
-            gc.collect()
-            torch.cuda.empty_cache()
+        first_expert = origin_mlp.experts[0]
+        self.intermediate_size = first_expert.intermediate_size
+        self.total_intermediate_size = self.intermediate_size * self.num_experts
+        self.act_fn = first_expert.act_fn
+        dtype = first_expert.gate_proj.weight.dtype
+        device = first_expert.gate_proj.weight.device
+
+        self.combined_w1_weight = torch.empty(
+            self.total_intermediate_size,
+            self.hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+        self.combined_w3_weight = torch.empty(
+            self.total_intermediate_size,
+            self.hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+        self.combined_w2_weight = torch.empty(
+            self.hidden_size,
+            self.total_intermediate_size,
+            dtype=dtype,
+            device=device,
+        )
+
+        start_idx = 0
+        for expert in origin_mlp.experts:
+            end_idx = start_idx + self.intermediate_size
+            self.combined_w1_weight[start_idx:end_idx, :] = expert.gate_proj.weight.data
+            self.combined_w3_weight[start_idx:end_idx, :] = expert.up_proj.weight.data
+            self.combined_w2_weight[:, start_idx:end_idx] = expert.down_proj.weight.data
+            start_idx = end_idx
+            del expert.gate_proj.weight
+            del expert.up_proj.weight
+            del expert.down_proj.weight
+
+        del origin_mlp.experts
+        gc.collect()
+        torch.cuda.empty_cache()
 
         self.w1_weight_by_expert = self.combined_w1_weight.view(
             self.num_experts,
@@ -116,30 +145,35 @@ class SPMLP(nn.Module):
             self.hidden_size,
         )
 
-        if forward_mode not in {"main", "bm"}:
-            raise ValueError(f"Unsupported forward mode: {forward_mode}")
-        if unsupported_batch_fallback_mode not in {"original", "bm"}:
-            raise ValueError(
-                f"Unsupported unsupported_batch_fallback_mode: {unsupported_batch_fallback_mode}"
-            )
-        if runtime_t_d_fallback_mode not in {"none", "original", "bm"}:
-            raise ValueError(f"Unsupported runtime_t_d_fallback_mode: {runtime_t_d_fallback_mode}")
-
         self.gate = origin_mlp.gate
-        self.base_t_d = self.num_experts // 2 if t_d is None else t_d
-        self.t_d = self.base_t_d
-        self.maxnnz = 4
-        self.adaptive_t_d = adaptive_t_d
-        self.bm_fallback_t_d = self.base_t_d if bm_fallback_t_d is None else bm_fallback_t_d
-        self.forward_mode = forward_mode
-        self.unsupported_batch_fallback_mode = unsupported_batch_fallback_mode
-        self.runtime_t_d_fallback_mode = runtime_t_d_fallback_mode
 
-        self.kernel_path_calls = 0
-        self.unsupported_batch_fallback_calls = 0
-        self.runtime_t_d_fallback_calls = 0
-        self.original_forward_calls = 0
-        self.bm_forward_calls = 0
+    def _init_gpt_oss_moe(self, origin_mlp):
+        self.model_variant = "gpt_oss"
+        self.supports_main_kernel = False
+
+        experts = origin_mlp.experts
+        router = origin_mlp.router
+
+        self.hidden_size = experts.hidden_size
+        self.num_experts = experts.num_experts
+        self.top_k = router.top_k
+        self.norm_topk_prob = False
+        self.intermediate_size = experts.expert_dim
+        self.total_intermediate_size = self.intermediate_size * self.num_experts
+        self.act_fn = None
+        self.alpha = float(experts.alpha)
+        self.limit = float(experts.limit)
+
+        self.gate_up_proj = experts.gate_up_proj.detach().clone()
+        self.gate_up_proj_bias = experts.gate_up_proj_bias.detach().clone()
+        self.down_proj = experts.down_proj.detach().clone()
+        self.down_proj_bias = experts.down_proj_bias.detach().clone()
+
+        self.gate = router
+
+        del origin_mlp.experts
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def get_path_stats(self):
         return {
@@ -150,26 +184,45 @@ class SPMLP(nn.Module):
             "bm_forward_calls": self.bm_forward_calls,
         }
 
-    def _select_routing_inputs(self, router_logits):
-        full_routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    def _select_routing_inputs(self, router_output, target_dtype=None):
+        if self.model_variant == "gpt_oss":
+            router_weights, selected_experts = router_output
+            routing_weights = torch.gather(router_weights, 1, selected_experts)
+            if target_dtype is None:
+                target_dtype = router_weights.dtype
+            return routing_weights.to(target_dtype), selected_experts
+
+        full_routing_weights = F.softmax(router_output, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(full_routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(router_logits.dtype)
+        if target_dtype is None:
+            target_dtype = router_output.dtype
+        routing_weights = routing_weights.to(target_dtype)
         return routing_weights, selected_experts
 
-    def _build_router_weights_from_topk(self, router_logits, routing_weights, selected_experts):
-        router_weights = torch.zeros_like(router_logits)
+    def _build_router_weights_from_topk(self, router_output, routing_weights, selected_experts):
+        if self.model_variant == "gpt_oss":
+            return router_output[0]
+        router_weights = torch.zeros_like(router_output)
         router_weights.scatter_(1, selected_experts, routing_weights)
         return router_weights
 
-    def _build_routing_inputs(self, router_logits):
-        routing_weights, selected_experts = self._select_routing_inputs(router_logits)
-        router_weights = self._build_router_weights_from_topk(router_logits, routing_weights, selected_experts)
+    def _build_routing_inputs(self, router_output, target_dtype=None):
+        routing_weights, selected_experts = self._select_routing_inputs(router_output, target_dtype=target_dtype)
+        router_weights = self._build_router_weights_from_topk(router_output, routing_weights, selected_experts)
         return router_weights, routing_weights, selected_experts
 
-    def mixer_with_fallback(self, router_logits):
-        router_weights, routing_weights, selected_experts = self._build_routing_inputs(router_logits)
+    def _router_output_for_return(self, router_output):
+        if self.model_variant == "gpt_oss":
+            return router_output[0]
+        return router_output
+
+    def mixer_with_fallback(self, router_output):
+        router_weights, routing_weights, selected_experts = self._build_routing_inputs(
+            router_output,
+            target_dtype=router_output[0].dtype if self.model_variant == "gpt_oss" else router_output.dtype,
+        )
         expert_hit_count = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
         col_sums = router_weights.sum(dim=0)
         runtime_t_d = torch.count_nonzero(expert_hit_count > self.maxnnz).item()
@@ -233,14 +286,65 @@ class SPMLP(nn.Module):
             return self.original_forward(hidden_states)
         raise ValueError(f"Unsupported fallback mode: {mode}")
 
+    def _gpt_oss_dense_forward(
+        self,
+        hidden_states: torch.Tensor,
+        batch_size: int,
+        sequence_length: int,
+        router_logits: torch.Tensor | None = None,
+        routing_weights: torch.Tensor | None = None,
+        selected_experts: torch.Tensor | None = None,
+    ):
+        hidden_dim = hidden_states.shape[-1]
+        router_return = router_logits
+        if (routing_weights is None) != (selected_experts is None):
+            raise ValueError("routing_weights and selected_experts must be provided together")
+
+        if routing_weights is None:
+            router_output = self.gate(hidden_states)
+            router_return = self._router_output_for_return(router_output)
+            _, routing_weights, selected_experts = self._build_routing_inputs(
+                router_output,
+                target_dtype=hidden_states.dtype,
+            )
+        else:
+            routing_weights = routing_weights.to(hidden_states.dtype)
+            if router_return is None:
+                router_return = torch.zeros(
+                    (hidden_states.shape[0], self.num_experts),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                router_return.scatter_(1, selected_experts, routing_weights)
+
+        expert_inputs = hidden_states.repeat(self.num_experts, 1).view(self.num_experts, -1, hidden_dim)
+        gate_up = torch.bmm(expert_inputs, self.gate_up_proj) + self.gate_up_proj_bias[:, None, :]
+        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+        gate = gate.clamp(min=None, max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        glu = gate * torch.sigmoid(gate * self.alpha)
+        expert_outputs = torch.bmm((up + 1) * glu, self.down_proj)
+        expert_outputs = expert_outputs + self.down_proj_bias[:, None, :]
+        expert_outputs = expert_outputs.permute(1, 0, 2)
+
+        gather_index = selected_experts.unsqueeze(-1).expand(-1, -1, hidden_dim)
+        token_outputs = expert_outputs.gather(1, gather_index)
+        final_hidden_states = (token_outputs * routing_weights.unsqueeze(-1)).sum(dim=1)
+        return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_return
+
     def original_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         self.original_forward_calls += 1
+        if self.model_variant == "gpt_oss":
+            batch_size, sequence_length, _ = hidden_states.shape
+            flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            return self._gpt_oss_dense_forward(flat_hidden_states, batch_size, sequence_length)
+
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        router_logits = self.gate(hidden_states)
+        router_output = self.gate(hidden_states)
+        router_logits = self._router_output_for_return(router_output)
 
-        routing_weights, selected_experts = self._select_routing_inputs(router_logits)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        routing_weights, selected_experts = self._select_routing_inputs(router_output, target_dtype=hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim),
@@ -249,21 +353,19 @@ class SPMLP(nn.Module):
         )
 
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
         expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in expert_hitted:
+            expert_idx = int(expert_idx.item())
             start_idx = expert_idx * self.intermediate_size
             end_idx = start_idx + self.intermediate_size
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            idx, top_x = torch.where(expert_mask[expert_idx])
 
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-
             current_up = torch.matmul(current_state, self.combined_w3_weight[start_idx:end_idx, :].t())
             current_gate = torch.matmul(current_state, self.combined_w1_weight[start_idx:end_idx, :].t())
             current_activation = self.act_fn(current_gate)
             current_result = current_activation * current_up
             current_result = torch.matmul(current_result, self.combined_w2_weight[:, start_idx:end_idx].t())
-
             current_result = current_result * routing_weights[top_x, idx, None]
             final_hidden_states.index_add_(0, top_x, current_result.to(hidden_states.dtype))
 
@@ -271,6 +373,10 @@ class SPMLP(nn.Module):
         return final_hidden_states, router_logits
 
     def main_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self.supports_main_kernel:
+            self.unsupported_batch_fallback_calls += 1
+            return self._run_fallback(self.unsupported_batch_fallback_mode, hidden_states)
+
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         x = hidden_states.view(-1, hidden_dim)
         bs = x.size(0)
@@ -279,8 +385,9 @@ class SPMLP(nn.Module):
             self.unsupported_batch_fallback_calls += 1
             return self._run_fallback(self.unsupported_batch_fallback_mode, hidden_states)
 
-        router_logits = self.gate(x)
-        mixer_output = self.mixer_with_fallback(router_logits)
+        router_output = self.gate(x)
+        router_logits = self._router_output_for_return(router_output)
+        mixer_output = self.mixer_with_fallback(router_output)
         if mixer_output["use_runtime_t_d_fallback"]:
             self.runtime_t_d_fallback_calls += 1
             return self._run_fallback(
@@ -360,21 +467,32 @@ class SPMLP(nn.Module):
         else:
             raise ValueError(f"Unsupported hidden_states shape: {hidden_states.shape}")
 
+        if self.model_variant == "gpt_oss":
+            return self._gpt_oss_dense_forward(
+                hidden_states,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                router_logits=router_logits,
+                routing_weights=routing_weights,
+                selected_experts=selected_experts,
+            )
+
         if (routing_weights is None) != (selected_experts is None):
             raise ValueError("routing_weights and selected_experts must be provided together")
 
         if router_logits is None:
-            router_logits = self.gate(hidden_states)
+            router_output = self.gate(hidden_states)
+            router_logits = self._router_output_for_return(router_output)
+        else:
+            router_output = router_logits
 
         if routing_weights is None:
-            routing_weights, selected_experts = self._select_routing_inputs(router_logits)
+            routing_weights, selected_experts = self._select_routing_inputs(router_output, target_dtype=hidden_states.dtype)
         else:
             routing_weights = routing_weights.to(hidden_states.dtype)
 
-        ffn_dim_per_expert = self.intermediate_size
         num_experts = self.num_experts
         bsl = batch_size * sequence_length
-
         expanded_hidden_states = hidden_states.unsqueeze(1).expand(-1, self.top_k, -1)
 
         w1_weights = self.w1_weight_by_expert.transpose(-2, -1)

@@ -44,15 +44,29 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import (
-    LossKwargs,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    can_return_tuple,
-    logging,
-    replace_return_docstrings,
-)
+try:
+    from transformers.utils import (
+        LossKwargs,
+        add_code_sample_docstrings,
+        add_start_docstrings,
+        add_start_docstrings_to_model_forward,
+        can_return_tuple,
+        logging,
+        replace_return_docstrings,
+    )
+except ImportError:
+    from typing import TypedDict
+    from transformers.utils import (
+        add_code_sample_docstrings,
+        add_start_docstrings,
+        add_start_docstrings_to_model_forward,
+        can_return_tuple,
+        logging,
+        replace_return_docstrings,
+    )
+
+    class LossKwargs(TypedDict, total=False):
+        pass
 from transformers.utils.deprecation import deprecate_kwarg
 from .configuration_qwen3_moe import Qwen3MoeConfig
 
