@@ -1,5 +1,46 @@
 # Mixed Dense-Sparse Triton SDDMM Task Plan
 
+## Session Handoff Snapshot
+
+This section is for the next session to recover context quickly without re-reading the whole thread.
+
+- Current `HEAD` when this file was last updated:
+  - `b240a75` `Complete Step 5 sparse mixed SDDMM validation`
+- Current workspace state at handoff:
+  - code changes from Steps 1 through 5 are committed
+  - the working tree has no tracked modifications
+  - unrelated untracked data directories still exist under:
+    - `benchmark/boolq/`
+    - `benchmark/commonsense_qa/`
+    - `benchmark/hellaswag/`
+    - `benchmark/piqa/`
+    - `benchmark/siqa/`
+    - `benchmark/sst2/`
+- High-level status:
+  - Step 1 is done
+  - Step 2 is done
+  - Step 3 is done
+  - Step 4 is done
+  - Step 5 is done
+  - Steps 6 through 8 are the remaining formal work items
+- Important nuance:
+  - Step 6 is not marked done, but part of its functionality already exists in practice
+  - `moe_src/triton_kernels/mixed_sddmm.py` already has host-side launch metadata, dense/sparse program counts, program-id decoding, and a mixed launcher
+  - what is still missing for Step 6 is mostly "finish/document/formalize" work rather than greenfield implementation
+- Current primary files to inspect first in a new session:
+  - `moe_src/triton_kernels/mixed_sddmm.py`
+  - `moe_src/test/test_mixed_sddmm.py`
+  - `moe_src/sddmm_validation/mixed_sddmm.py`
+  - `moe_src/run.sh`
+  - `moe_src/run_test.sh`
+- Current benchmark interpretation to keep in mind:
+  - comparing Triton mixed kernel against full dense PyTorch `mm` can be misleading because that path is a much more optimized library baseline than the mixed-work decomposition
+  - a more apples-to-apples dense baseline was added using `torch.bmm` over reshaped per-expert weights
+  - with that `bmm` baseline, the mixed Triton kernel is currently not obviously behind; observed ratios were roughly `0.65x` to `0.84x` in the tested environment
+- Recommended next task for a new session:
+  - either close Step 6 formally by tightening metadata/scheduler documentation and coverage
+  - or move directly to Step 8 and wire the Triton launcher behind an explicit dev/integration path
+
 ## Goal
 Implement a Triton validation kernel for the MoE SDDMM stage with an adjustable sparse width, so the dense part width and sparse part width can be tuned independently. The kernel must:
 
@@ -160,6 +201,33 @@ Step 5 is complete in the current branch.
   - sparse-only cases with `hidden_dim = 128`, `expert_block_size = 96`, `sparse_width = 4`, `maxnnz = 8`, and `batch_size in {16, 32, 64}`
   - mixed cases with varying `(dense_width, sparse_width, maxnnz)` and non-uniform `(batch_size, hidden_dim, expert_block_size)`
 
+## Remaining Work Clarification
+
+These notes are here so the next session does not waste time rediscovering what is already present.
+
+- Step 6 status:
+  - not formally marked done yet
+  - however, `moe_src/triton_kernels/mixed_sddmm.py` already contains:
+    - launch metadata construction
+    - dense and sparse program counts
+    - dense/sparse program ranges
+    - host-side `program_id -> region/tile` decoding helpers
+    - mixed wrapper and explicit mixed-only launcher
+  - the missing Step 6 work is mainly:
+    - decide whether the current metadata API is final enough to bless as the public scheduler contract
+    - tighten the documentation around the scheduler invariants
+    - decide whether additional explicit coverage is needed before marking Step 6 done
+- Step 7 status:
+  - also largely present in practice
+  - `moe_src/test/test_mixed_sddmm.py` already acts as the unified correctness and speed harness
+  - remaining work is mainly organizational:
+    - decide whether this is sufficient as the final Step 7 deliverable
+    - or whether a separate executable benchmark script is still desired
+- Step 8 status:
+  - partially present through `moe_src/run.sh`, `moe_src/run_test.sh`, and the existing `moe_src/test/test.py` flow
+  - not yet complete as a clean, explicit Triton validation integration mode in the broader MoE path
+  - this is likely the most concrete remaining implementation task
+
 ## Test Runner Notes
 
 - `moe_src/run_test.sh` now treats `moe_src/test/test_mixed_sddmm.py` as the default mixed SDDMM validation test.
@@ -200,6 +268,15 @@ Step 5 is complete in the current branch.
     - `hidden_dim = 2048`
     - split cases `(dense_width, sparse_width) in {(12, 4), (8, 8), (4, 12)}`
     - `maxnnz in {4, 8, 16, 32, batch_size}` after clipping to `<= batch_size`
+  - this benchmark was added after observing that the full dense PyTorch `mm` baseline was not a fair comparison for mixed-work decomposition
+  - the `torch.bmm` baseline is constructed by:
+    - repeating `x` across experts
+    - reshaping weights into `[num_experts, expert_block_size, hidden_dim]`
+    - running per-expert batched matmul and then applying `silu`
+  - the observed mixed-to-`bmm` latency ratio in the tested environment is roughly:
+    - best cases around `0.65x`
+    - typical cases around `0.7x` to `0.8x`
+    - higher-work mixed cases still below `1.0x` in the observed runs
 - `RUN_MIXED_SDDMM_TUNE=1 python -m unittest moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_dense_only_parameter_sweep` passes.
   - this prints the ranked launch-parameter sweep results for the current GPU
 - `CUDA_VISIBLE_DEVICES=-1 bash moe_src/run_test.sh` passes.
@@ -223,6 +300,13 @@ Step 5 is complete in the current branch.
 - optional shared metadata helper if the launcher logic becomes non-trivial
 
 ## How To Validate
+
+If a new session needs a minimal "trust but verify" sequence, use this order:
+
+1. `python -m unittest moe_src.test.test_mixed_sddmm`
+2. `bash moe_src/run.sh`
+3. `RUN_MIXED_SDDMM_BENCH=1 python -m unittest moe_src.test.test_mixed_sddmm.MixedSDDMMTritonTest.test_mixed_vs_dense_torch_bmm_benchmark`
+4. `bash moe_src/run.sh --speed`
 
 Correctness:
 
@@ -266,3 +350,10 @@ The task is complete when the repository has:
 
 - The first validation target should be the SDDMM stage only. Keep the current CUDA `spmm` path unchanged until the new SDDMM layout and scheduling are proven correct.
 - If the single-kernel dense/sparse branch causes unacceptable divergence, keep the unified launch prototype for validation but be ready to split it later. That is an optimization fallback, not the first implementation target.
+- The current implementation already supports:
+  - pure dense via specialized fast path
+  - pure sparse via specialized fast path
+  - true mixed dense+sparse via one-launch mixed kernel
+- The current discussion about performance should not treat all baselines as equivalent:
+  - full dense `mm` is useful as an upper bound for library GEMM throughput
+  - per-expert `bmm` is the more relevant comparison when judging mixed work decomposition overhead

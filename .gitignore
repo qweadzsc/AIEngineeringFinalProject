@@ -34,3 +34,7 @@ codex/
 moe_src/test/torch_cuda*_sweep.csv
 moe_src/test/torch_cuda*_sweep.png
 moe_src/test/torch_cuda*_sweep_metadata.txt
+
+moe_test/bm_fallback_td_sweep.csv
+moe_test/bm_fallback_td_sweep.png
+moe_test/bm_fallback_td_sweep_metadata.txt

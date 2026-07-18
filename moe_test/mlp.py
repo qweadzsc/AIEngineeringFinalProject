@@ -38,7 +38,16 @@ def print_diff(tensor1, tensor2, eps=3e-3):
 
 
 class SPMLP(nn.Module):
-    def __init__(self, origin_mlp, t_d=None, forward_mode="main", bm_fallback_t_d=None):
+    def __init__(
+        self,
+        origin_mlp,
+        t_d=None,
+        forward_mode="main",
+        adaptive_t_d=True,
+        bm_fallback_t_d=None,
+        unsupported_batch_fallback_mode="bm",
+        runtime_t_d_fallback_mode="bm",
+    ):
         super().__init__()
 
         with torch.no_grad():
@@ -91,38 +100,92 @@ class SPMLP(nn.Module):
             gc.collect()
             torch.cuda.empty_cache()
 
-        self.gate = origin_mlp.gate
-        self.t_d = self.num_experts // 2 if t_d is None else t_d
-        self.maxnnz = 4
-        self.bm_fallback_t_d = self.t_d if bm_fallback_t_d is None else bm_fallback_t_d
-        self.t_d_temp = 0
+        self.w1_weight_by_expert = self.combined_w1_weight.view(
+            self.num_experts,
+            self.intermediate_size,
+            self.hidden_size,
+        )
+        self.w3_weight_by_expert = self.combined_w3_weight.view(
+            self.num_experts,
+            self.intermediate_size,
+            self.hidden_size,
+        )
+        self.w2_weight_by_expert = self.combined_w2_weight.transpose(-2, -1).view(
+            self.num_experts,
+            self.intermediate_size,
+            self.hidden_size,
+        )
+
         if forward_mode not in {"main", "bm"}:
             raise ValueError(f"Unsupported forward mode: {forward_mode}")
-        self.forward_mode = forward_mode
+        if unsupported_batch_fallback_mode not in {"original", "bm"}:
+            raise ValueError(
+                f"Unsupported unsupported_batch_fallback_mode: {unsupported_batch_fallback_mode}"
+            )
+        if runtime_t_d_fallback_mode not in {"none", "original", "bm"}:
+            raise ValueError(f"Unsupported runtime_t_d_fallback_mode: {runtime_t_d_fallback_mode}")
 
-    def _build_routing_inputs(self, router_logits):
+        self.gate = origin_mlp.gate
+        self.base_t_d = self.num_experts // 2 if t_d is None else t_d
+        self.t_d = self.base_t_d
+        self.maxnnz = 4
+        self.adaptive_t_d = adaptive_t_d
+        self.bm_fallback_t_d = self.base_t_d if bm_fallback_t_d is None else bm_fallback_t_d
+        self.forward_mode = forward_mode
+        self.unsupported_batch_fallback_mode = unsupported_batch_fallback_mode
+        self.runtime_t_d_fallback_mode = runtime_t_d_fallback_mode
+
+        self.kernel_path_calls = 0
+        self.unsupported_batch_fallback_calls = 0
+        self.runtime_t_d_fallback_calls = 0
+        self.original_forward_calls = 0
+        self.bm_forward_calls = 0
+
+    def get_path_stats(self):
+        return {
+            "kernel_path_calls": self.kernel_path_calls,
+            "unsupported_batch_fallback_calls": self.unsupported_batch_fallback_calls,
+            "runtime_t_d_fallback_calls": self.runtime_t_d_fallback_calls,
+            "original_forward_calls": self.original_forward_calls,
+            "bm_forward_calls": self.bm_forward_calls,
+        }
+
+    def _select_routing_inputs(self, router_logits):
         full_routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(full_routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(router_logits.dtype)
+        return routing_weights, selected_experts
 
+    def _build_router_weights_from_topk(self, router_logits, routing_weights, selected_experts):
         router_weights = torch.zeros_like(router_logits)
         router_weights.scatter_(1, selected_experts, routing_weights)
+        return router_weights
+
+    def _build_routing_inputs(self, router_logits):
+        routing_weights, selected_experts = self._select_routing_inputs(router_logits)
+        router_weights = self._build_router_weights_from_topk(router_logits, routing_weights, selected_experts)
         return router_weights, routing_weights, selected_experts
 
     def mixer_with_fallback(self, router_logits):
         router_weights, routing_weights, selected_experts = self._build_routing_inputs(router_logits)
         expert_hit_count = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts)
         col_sums = router_weights.sum(dim=0)
-        self.t_d_temp = torch.count_nonzero(expert_hit_count > self.maxnnz).item()
-        use_bm_fallback = self.t_d_temp > self.bm_fallback_t_d
+        runtime_t_d = torch.count_nonzero(expert_hit_count > self.maxnnz).item()
+        self.t_d = runtime_t_d if self.adaptive_t_d else self.base_t_d
+        effective_t_d = self.t_d if self.t_d > 0 else 1
+        use_runtime_t_d_fallback = (
+            self.runtime_t_d_fallback_mode != "none"
+            and self.bm_fallback_t_d is not None
+            and runtime_t_d > self.bm_fallback_t_d
+        )
 
         sorted_experts = None
         mask_r = None
-        if not use_bm_fallback:
+        if not use_runtime_t_d_fallback:
             _, sorted_experts = torch.sort(col_sums, descending=True)
-            sparse_candidates = sorted_experts[-self.t_d :]
+            sparse_candidates = sorted_experts[-effective_t_d:]
             selected_weights = router_weights[:, sparse_candidates]
             _, mask_r = torch.topk(selected_weights, self.maxnnz, dim=0)
 
@@ -133,19 +196,50 @@ class SPMLP(nn.Module):
             "sorted_experts": sorted_experts,
             "mask_r": mask_r,
             "col_sums": col_sums,
-            "t_d_temp": self.t_d_temp,
-            "use_bm_fallback": use_bm_fallback,
+            "t_d": self.t_d,
+            "runtime_t_d": runtime_t_d,
+            "effective_t_d": effective_t_d,
+            "use_runtime_t_d_fallback": use_runtime_t_d_fallback,
+            "use_bm_fallback": use_runtime_t_d_fallback and self.runtime_t_d_fallback_mode == "bm",
         }
 
+    def _run_fallback(
+        self,
+        mode: str,
+        hidden_states: torch.Tensor,
+        *,
+        batch_size: int | None = None,
+        sequence_length: int | None = None,
+        router_logits: torch.Tensor | None = None,
+        routing_weights: torch.Tensor | None = None,
+        selected_experts: torch.Tensor | None = None,
+    ):
+        if mode == "bm":
+            return self.bm_forward_with_extra_input(
+                hidden_states,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                router_logits=router_logits,
+                routing_weights=routing_weights,
+                selected_experts=selected_experts,
+            )
+        if mode == "original":
+            if hidden_states.dim() == 2:
+                if batch_size is None or sequence_length is None:
+                    raise ValueError(
+                        "batch_size and sequence_length are required for original fallback when hidden_states is 2D"
+                    )
+                hidden_states = hidden_states.view(batch_size, sequence_length, -1)
+            return self.original_forward(hidden_states)
+        raise ValueError(f"Unsupported fallback mode: {mode}")
+
     def original_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.original_forward_calls += 1
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights, selected_experts = self._select_routing_inputs(router_logits)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
@@ -182,12 +276,15 @@ class SPMLP(nn.Module):
         bs = x.size(0)
 
         if bs not in [32, 64, 128]:
-            return self.bm_forward(hidden_states)
+            self.unsupported_batch_fallback_calls += 1
+            return self._run_fallback(self.unsupported_batch_fallback_mode, hidden_states)
 
         router_logits = self.gate(x)
         mixer_output = self.mixer_with_fallback(router_logits)
-        if mixer_output["use_bm_fallback"]:
-            return self.bm_forward_with_extra_input(
+        if mixer_output["use_runtime_t_d_fallback"]:
+            self.runtime_t_d_fallback_calls += 1
+            return self._run_fallback(
+                self.runtime_t_d_fallback_mode,
                 x,
                 batch_size=batch_size,
                 sequence_length=sequence_length,
@@ -196,14 +293,16 @@ class SPMLP(nn.Module):
                 selected_experts=mixer_output["selected_experts"],
             )
 
+        self.kernel_path_calls += 1
         with torch.no_grad():
             router_weights = mixer_output["router_weights"]
             sorted_experts = mixer_output["sorted_experts"]
             mask_r = mixer_output["mask_r"]
+            kernel_t_d = mixer_output["effective_t_d"]
 
-            ir = torch.zeros((2, bs, self.intermediate_size * self.t_d), device=x.device, dtype=x.dtype)
-            mask_v = torch.zeros((2, self.maxnnz, self.t_d * self.intermediate_size), device=x.device, dtype=x.dtype)
-            result = torch.zeros((self.t_d, bs, self.hidden_size), device=x.device, dtype=x.dtype)
+            ir = torch.zeros((2, bs, self.intermediate_size * kernel_t_d), device=x.device, dtype=x.dtype)
+            mask_v = torch.zeros((2, self.maxnnz, kernel_t_d * self.intermediate_size), device=x.device, dtype=x.dtype)
+            result = torch.zeros((kernel_t_d, bs, self.hidden_size), device=x.device, dtype=x.dtype)
 
             mlp_kernel.ops.sddmm(
                 x,
@@ -217,7 +316,7 @@ class SPMLP(nn.Module):
                 hidden_dim,
                 self.total_intermediate_size,
                 self.intermediate_size,
-                self.t_d,
+                kernel_t_d,
                 self.maxnnz,
             )
 
@@ -233,7 +332,7 @@ class SPMLP(nn.Module):
                 hidden_dim,
                 self.total_intermediate_size,
                 self.intermediate_size,
-                self.t_d,
+                kernel_t_d,
                 self.maxnnz,
             )
             x = result.sum(0)
@@ -250,6 +349,7 @@ class SPMLP(nn.Module):
         routing_weights: torch.Tensor | None = None,
         selected_experts: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self.bm_forward_calls += 1
         if hidden_states.dim() == 3:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
             hidden_states = hidden_states.view(-1, hidden_dim)
@@ -267,7 +367,7 @@ class SPMLP(nn.Module):
             router_logits = self.gate(hidden_states)
 
         if routing_weights is None:
-            _, routing_weights, selected_experts = self._build_routing_inputs(router_logits)
+            routing_weights, selected_experts = self._select_routing_inputs(router_logits)
         else:
             routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -277,9 +377,9 @@ class SPMLP(nn.Module):
 
         expanded_hidden_states = hidden_states.unsqueeze(1).expand(-1, self.top_k, -1)
 
-        w1_weights = self.combined_w1_weight.view(num_experts, ffn_dim_per_expert, hidden_dim).transpose(-2, -1)
-        w3_weights = self.combined_w3_weight.view(num_experts, ffn_dim_per_expert, hidden_dim).transpose(-2, -1)
-        w2_weights = self.combined_w2_weight.transpose(-2, -1).view(num_experts, ffn_dim_per_expert, hidden_dim)
+        w1_weights = self.w1_weight_by_expert.transpose(-2, -1)
+        w3_weights = self.w3_weight_by_expert.transpose(-2, -1)
+        w2_weights = self.w2_weight_by_expert
 
         expert_inputs = torch.zeros(
             (num_experts, bsl, hidden_dim),
